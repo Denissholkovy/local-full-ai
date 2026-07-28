@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { ICONS } = require('./icons');
 const { isVisionModel } = require('./modelCapabilities');
+const ollamaProcess = require('./ollamaProcess');
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
 const TEXT_FILE_EXTENSIONS = [
@@ -77,11 +78,42 @@ class ChatPanel {
         if (this._currentAbort) this._currentAbort();
       } else if (msg.type === 'ready') {
         this._sendModelInfo();
+      } else if (msg.type === 'startOllamaServer') {
+        await this._startOllamaServer();
       }
     });
 
     this._panel.onDidDispose(() => {
       ChatPanel.currentPanel = undefined;
+    });
+  }
+
+  async _startOllamaServer() {
+    const result = ollamaProcess.startServer();
+
+    if (!result.started && result.reason === 'already-running') {
+      this._panel.webview.postMessage({
+        type: 'serverStartResult',
+        ok: true,
+        text: 'Ollama is already running - try sending your message again.'
+      });
+      return;
+    }
+
+    if (!result.started) {
+      this._panel.webview.postMessage({
+        type: 'serverStartResult',
+        ok: false,
+        text: `Could not start Ollama: ${result.reason}`
+      });
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    this._panel.webview.postMessage({
+      type: 'serverStartResult',
+      ok: true,
+      text: 'Ollama server started - try sending your message again.'
     });
   }
 
@@ -219,9 +251,13 @@ class ChatPanel {
       this._panel.webview.postMessage({ type: 'assistantEnd' });
     } catch (err) {
       this._currentAbort = null;
+      const isConnRefused = err.code === 'ECONNREFUSED' || /ECONNREFUSED/.test(err.message);
       this._panel.webview.postMessage({
         type: 'error',
-        text: `Error: ${err.message}`
+        text: isConnRefused
+          ? "Could not reach Ollama - the server isn't running."
+          : `Error: ${err.message}`,
+        showStartServer: isConnRefused
       });
     }
   }
@@ -855,13 +891,33 @@ class ChatPanel {
         currentRaw = '';
         setGeneratingUI(false);
         break;
-      case 'error':
+      case 'error': {
         if (stoppedByUser) {
           stoppedByUser = false;
           break;
         }
-        addRow(escapeHtml(msg.text), 'error');
+        let html = escapeHtml(msg.text);
+        if (msg.showStartServer) {
+          html += '<div style="margin-top:8px;">' +
+            '<button id="startServerBtn" style="display:inline-flex;align-items:center;gap:6px;width:auto;">' +
+            ${JSON.stringify(ICONS.play)} + ' Start Ollama server</button></div>';
+        }
+        const errBubble = addRow(html, 'error');
+        if (msg.showStartServer) {
+          const btn = errBubble.querySelector('#startServerBtn');
+          if (btn) {
+            btn.onclick = () => {
+              btn.disabled = true;
+              btn.textContent = 'Starting...';
+              vscode.postMessage({ type: 'startOllamaServer' });
+            };
+          }
+        }
         setGeneratingUI(false);
+        break;
+      }
+      case 'serverStartResult':
+        addRow(escapeHtml(msg.text), msg.ok ? 'assistant' : 'error');
         break;
       case 'fileAttached':
         pendingAttachment = msg;

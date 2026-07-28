@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 const { RECOMMENDED_MODELS } = require('./modelPicker');
 const { ICONS } = require('./icons');
+const ollamaProcess = require('./ollamaProcess');
 
 class SidebarProvider {
   constructor(context, ollamaClient) {
@@ -26,6 +27,9 @@ class SidebarProvider {
           break;
         case 'autoInstallOllama':
           this._autoInstallOllama();
+          break;
+        case 'startOllamaServer':
+          await this._startOllamaServer();
           break;
         case 'uninstallOllama':
           this._uninstallOllama();
@@ -115,6 +119,30 @@ class SidebarProvider {
     );
 
     await this._context.globalState.update('localAI.selectedModel', undefined);
+  }
+
+  async _startOllamaServer() {
+    const result = ollamaProcess.startServer();
+
+    if (!result.started && result.reason === 'already-running') {
+      vscode.window.showInformationMessage('Ollama server is already running.');
+      await this._refreshState();
+      return;
+    }
+
+    if (!result.started) {
+      vscode.window.showErrorMessage(
+        `Could not start Ollama: ${result.reason}. Make sure Ollama is installed and the "ollama" command is on your PATH.`
+      );
+      return;
+    }
+
+    vscode.window.showInformationMessage(
+      'Starting Ollama server... it will stop automatically when you close VS Code.'
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await this._refreshState();
   }
 
   _autoInstallOllama() {
@@ -455,11 +483,18 @@ class SidebarProvider {
     if (state.view === 'notRunning') {
       content.innerHTML =
         '<div class="box warn">${ICONS.warning} Ollama was not found or is not running on localhost.</div>' +
-        '<h3>Step 1</h3>' +
-        '<button class="primary" id="btnAutoInstall">${ICONS.bolt} Install automatically</button>' +
+        '<h3>Already installed?</h3>' +
+        '<button class="primary" id="btnStartServer">${ICONS.play} Start Ollama server</button>' +
+        '<h3 style="margin-top:14px;">Not installed yet?</h3>' +
+        '<button id="btnAutoInstall">${ICONS.bolt} Install automatically</button>' +
         '<button id="btnDownload">${ICONS.download} Download manually (website)</button>' +
         '<button id="btnRecheck">${ICONS.refresh} I installed it, check again</button>' +
         '<div class="danger-zone"><button id="btnUninstall" class="danger-link">${ICONS.trash} Uninstall Ollama completely</button></div>';
+      document.getElementById('btnStartServer').onclick = () => {
+        state.view = 'loading';
+        render();
+        send('startOllamaServer');
+      };
       document.getElementById('btnAutoInstall').onclick = () => send('autoInstallOllama');
       document.getElementById('btnDownload').onclick = () => send('openOllamaSite');
       document.getElementById('btnRecheck').onclick = () => {

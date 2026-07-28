@@ -3,6 +3,7 @@ const { OllamaClient } = require('./ollamaClient');
 const { pickAndInstallModel } = require('./modelPicker');
 const { ChatPanel } = require('./chatPanel');
 const { SidebarProvider } = require('./sidebarProvider');
+const ollamaProcess = require('./ollamaProcess');
 
 function activate(context) {
   const config = vscode.workspace.getConfiguration('localAI');
@@ -43,6 +44,8 @@ function activate(context) {
   console.log('Local Full AI activated. Runs fully locally through Ollama.');
 }
 
-function deactivate() {}
+function deactivate() {
+  ollamaProcess.stopServer();
+}
 
 module.exports = { activate, deactivate };

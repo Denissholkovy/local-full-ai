@@ -6,7 +6,7 @@ const ICONS_DIR = path.join(__dirname, '..', 'media', 'icons');
 const ICON_NAMES = [
   'box', 'chat', 'scissors', 'bolt', 'download', 'refresh', 'pencil',
   'trash', 'paperclip', 'send', 'stop', 'check', 'warning', 'eye',
-  'eyeOff', 'image', 'fileText', 'copy', 'insert', 'close'
+  'eyeOff', 'image', 'fileText', 'copy', 'insert', 'close', 'play'
 ];
 
 const ICONS = {};
