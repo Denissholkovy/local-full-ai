@@ -1,0 +1,96 @@
+{
+  "name": "local-full-ai",
+  "displayName": "Local Full AI",
+  "publisher": "Denys-Shovkovyi",
+  "description": "Local Full AI assistant for VS Code, powered by Ollama. Runs fully offline once a model is downloaded.",
+  "version": "0.0.2",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "keywords": [
+    "ai",
+    "ollama",
+    "local",
+    "offline",
+    "llm",
+    "chat",
+    "coding assistant"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Denissholkovy/local-full-ai"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning",
+    "Programming Languages"
+  ],
+  "activationEvents": [],
+  "main": "./src/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "localAI",
+          "title": "Local Full AI",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "localAI": [
+        {
+          "type": "webview",
+          "id": "localAI.sidebar",
+          "name": "Local Full AI"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "localAI.selectModel",
+        "title": "Local Full AI: Select / Download Model"
+      },
+      {
+        "command": "localAI.openChat",
+        "title": "Local Full AI: Open Chat"
+      },
+      {
+        "command": "localAI.askAboutSelection",
+        "title": "Local Full AI: Ask About Selected Code"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "localAI.askAboutSelection",
+          "when": "editorHasSelection",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Local Full AI",
+      "properties": {
+        "localAI.ollamaBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Address of the local Ollama server"
+        },
+        "localAI.selectedModel": {
+          "type": "string",
+          "default": "",
+          "description": "Currently selected model (filled in automatically via 'Select Model')"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "lint": "echo \"(no lint configured)\""
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0"
+  }
+}
