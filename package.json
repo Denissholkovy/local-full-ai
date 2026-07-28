@@ -3,7 +3,7 @@
   "displayName": "Local Full AI",
   "publisher": "Denys-Shovkovyi",
   "description": "Local Full AI assistant for VS Code, powered by Ollama. Runs fully offline once a model is downloaded.",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "license": "MIT",
   "icon": "media/icon.png",
   "keywords": [
