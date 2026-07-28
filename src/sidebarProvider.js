@@ -444,6 +444,45 @@ class SidebarProvider {
   }
   #loading { font-size: 12px; opacity: 0.7; }
   .divider { height: 1px; background: var(--vscode-widget-border); margin: 14px 0; }
+
+  .category-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    padding: 6px 4px;
+    margin-top: 10px;
+    border-radius: 4px;
+    user-select: none;
+  }
+  .category-header:hover {
+    background: rgba(127,127,127,0.15);
+  }
+  .category-header .chevron {
+    display: flex;
+    align-items: center;
+    opacity: 0.7;
+  }
+  .category-header .category-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    opacity: 0.9;
+    font-weight: 600;
+  }
+  .category-header .category-count {
+    font-size: 10px;
+    opacity: 0.55;
+    margin-left: auto;
+  }
+
+  .family-heading {
+    font-size: 10.5px;
+    opacity: 0.6;
+    margin: 10px 0 4px 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
   .danger-zone {
     margin-top: 16px;
     padding-top: 12px;
@@ -468,7 +507,8 @@ class SidebarProvider {
   const vscode = acquireVsCodeApi();
   const content = document.getElementById('content');
   let state = { view: 'loading' };
-  const pulls = {}; // modelName -> { percent, status, done, error }
+  const pulls = {};
+  const collapsedCategories = {};
 
   function send(type, extra) {
     vscode.postMessage(Object.assign({ type }, extra || {}));
@@ -535,12 +575,14 @@ class SidebarProvider {
         name: m.name,
         label: m.label,
         description: m.description,
-        category: m.category || 'general'
+        category: m.category || 'general',
+        family: m.family || m.name,
+        sizeGB: typeof m.sizeGB === 'number' ? m.sizeGB : 0
       }));
 
       state.installedModels.forEach((name) => {
         if (!allModels.find((m) => m.name === name)) {
-          allModels.unshift({ name, label: name, description: 'installed manually', category: 'other' });
+          allModels.unshift({ name, label: name, description: 'installed manually', category: 'other', family: name, sizeGB: 0 });
         }
       });
 
@@ -554,46 +596,69 @@ class SidebarProvider {
 
       categoryOrder.forEach((cat) => {
         if (!grouped[cat] || grouped[cat].length === 0) return;
-        html += '<h3 style="margin-top:14px;">' + (categoryLabels[cat] || cat) + '</h3>';
+        const isCollapsed = collapsedCategories[cat] !== false;
 
-        const sorted = grouped[cat].slice().sort((a, b) => {
-          const aActive = a.name === state.selectedModel ? 0 : 1;
-          const bActive = b.name === state.selectedModel ? 0 : 1;
-          if (aActive !== bActive) return aActive - bActive;
+        html += '<div class="category-header" data-category="' + cat + '">' +
+          '<span class="chevron">' + (isCollapsed ? '${ICONS.chevronRight}' : '${ICONS.chevronDown}') + '</span>' +
+          '<span class="category-title">' + (categoryLabels[cat] || cat) + '</span>' +
+          '<span class="category-count">' + grouped[cat].length + '</span>' +
+        '</div>';
 
-          const aInstalled = state.installedModels.includes(a.name) ? 0 : 1;
-          const bInstalled = state.installedModels.includes(b.name) ? 0 : 1;
-          return aInstalled - bInstalled;
+        if (isCollapsed) return;
+
+        const byFamily = {};
+        const familyOrder = [];
+        grouped[cat].forEach((m) => {
+          if (!byFamily[m.family]) {
+            byFamily[m.family] = [];
+            familyOrder.push(m.family);
+          }
+          byFamily[m.family].push(m);
         });
 
-        sorted.forEach((m) => {
-        const installed = state.installedModels.includes(m.name);
-        const isActive = state.selectedModel === m.name;
-        const pull = pulls[m.name];
+        const familyRank = familyOrder.map((fam, idx) => {
+          const models = byFamily[fam];
+          const hasActive = models.some((m) => m.name === state.selectedModel);
+          const hasInstalled = models.some((m) => state.installedModels.includes(m.name));
+          const priority = hasActive ? 0 : hasInstalled ? 1 : 2;
+          return { fam, priority, idx };
+        });
+        familyRank.sort((a, b) => a.priority - b.priority || a.idx - b.idx);
 
-        html += '<div class="model-card" data-model="' + m.name + '">';
-        html += '<div class="name"><span>' + m.label + '</span>';
-        html += '<span class="name-actions">';
-        if (isActive) html += '<span class="badge active">active</span>';
-        else if (installed) html += '<span class="badge">downloaded</span>';
-        if (installed) {
-          html += '<button class="icon-btn" data-action="delete" data-model="' + m.name + '" title="Delete model">${ICONS.trash}</button>';
-        }
-        html += '</span>';
-        html += '</div>';
-        html += '<div class="desc">' + (m.description || '') + '</div>';
+        familyRank.forEach(({ fam }) => {
+          const modelsInFamily = byFamily[fam].slice().sort((a, b) => a.sizeGB - b.sizeGB);
 
-        if (pull && !pull.done) {
-          html += '<div class="progress-track"><div class="progress-fill" style="width:' + (pull.percent || 0) + '%"></div></div>';
-          html += '<div class="progress-label">' + (pull.status || '') + ' ' + (pull.percent || 0) + '%</div>';
-        } else if (installed) {
-          html += '<button data-action="use" data-model="' + m.name + '"' + (isActive ? ' disabled' : '') + '>' +
-                  (isActive ? '${ICONS.check} Selected' : 'Use this model') + '</button>';
-        } else {
-          html += '<button data-action="install" data-model="' + m.name + '">Install</button>';
-        }
+          html += '<div class="family-heading">' + fam + '</div>';
 
-          html += '</div>';
+          modelsInFamily.forEach((m) => {
+            const installed = state.installedModels.includes(m.name);
+            const isActive = state.selectedModel === m.name;
+            const pull = pulls[m.name];
+
+            html += '<div class="model-card" data-model="' + m.name + '">';
+            html += '<div class="name"><span>' + m.label + '</span>';
+            html += '<span class="name-actions">';
+            if (isActive) html += '<span class="badge active">active</span>';
+            else if (installed) html += '<span class="badge">downloaded</span>';
+            if (installed) {
+              html += '<button class="icon-btn" data-action="delete" data-model="' + m.name + '" title="Delete model">${ICONS.trash}</button>';
+            }
+            html += '</span>';
+            html += '</div>';
+            html += '<div class="desc">' + (m.description || '') + '</div>';
+
+            if (pull && !pull.done) {
+              html += '<div class="progress-track"><div class="progress-fill" style="width:' + (pull.percent || 0) + '%"></div></div>';
+              html += '<div class="progress-label">' + (pull.status || '') + ' ' + (pull.percent || 0) + '%</div>';
+            } else if (installed) {
+              html += '<button data-action="use" data-model="' + m.name + '"' + (isActive ? ' disabled' : '') + '>' +
+                      (isActive ? '${ICONS.check} Selected' : 'Use this model') + '</button>';
+            } else {
+              html += '<button data-action="install" data-model="' + m.name + '">Install</button>';
+            }
+
+            html += '</div>';
+          });
         });
       });
 
@@ -601,6 +666,15 @@ class SidebarProvider {
       html += '<div class="danger-zone"><button id="btnUninstall" class="danger-link">${ICONS.trash} Uninstall Ollama completely</button></div>';
 
       content.innerHTML = html;
+
+      content.querySelectorAll('.category-header').forEach((header) => {
+        header.onclick = () => {
+          const cat = header.getAttribute('data-category');
+          const currentlyCollapsed = collapsedCategories[cat] !== false;
+          collapsedCategories[cat] = !currentlyCollapsed;
+          render();
+        };
+      });
 
       const chatBtn = document.getElementById('btnChat');
       if (chatBtn) chatBtn.onclick = () => send('openChat');

@@ -80,6 +80,9 @@ class ChatPanel {
         this._sendModelInfo();
       } else if (msg.type === 'startOllamaServer') {
         await this._startOllamaServer();
+      } else if (msg.type === 'clearChat') {
+        this._history = [];
+        if (this._currentAbort) this._currentAbort();
       }
     });
 
@@ -307,6 +310,29 @@ class ChatPanel {
     background: var(--vscode-badge-background, #4caf50);
     color: var(--vscode-badge-foreground, white);
     font-size: 11px;
+  }
+  #headerRight {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  #clearChatBtn {
+    background: transparent;
+    border: none;
+    color: var(--vscode-descriptionForeground);
+    cursor: pointer;
+    padding: 3px 5px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+  }
+  #clearChatBtn:hover {
+    background: rgba(244,71,71,0.15);
+    color: var(--vscode-errorForeground);
+  }
+  #clearChatBtn.confirming {
+    background: var(--vscode-errorForeground);
+    color: white;
   }
 
   #messages {
@@ -590,7 +616,10 @@ class ChatPanel {
 <body>
   <div id="header">
     <span class="title">${ICONS.chat} Local Full AI Chat</span>
-    <span id="modelBadge" style="display:none;"></span>
+    <div id="headerRight">
+      <span id="modelBadge" style="display:none;"></span>
+      <button id="clearChatBtn" title="Clear chat">${ICONS.trash}</button>
+    </div>
   </div>
   <div id="messages"></div>
   <div id="attachmentPreview">
@@ -619,6 +648,41 @@ class ChatPanel {
   const attachmentName = document.getElementById('attachmentName');
   const attachmentRemove = document.getElementById('attachmentRemove');
   const modelBadge = document.getElementById('modelBadge');
+  const clearChatBtn = document.getElementById('clearChatBtn');
+
+  let clearConfirmPending = false;
+
+  function doClearChat() {
+    if (isGenerating) {
+      vscode.postMessage({ type: 'stopGeneration' });
+    }
+    messagesEl.innerHTML = '';
+    currentBubble = null;
+    currentRaw = '';
+    pendingAttachment = null;
+    clearAttachment();
+    setGeneratingUI(false);
+    vscode.postMessage({ type: 'clearChat' });
+  }
+
+  clearChatBtn.addEventListener('click', () => {
+    if (clearConfirmPending) {
+      clearConfirmPending = false;
+      clearChatBtn.classList.remove('confirming');
+      doClearChat();
+      return;
+    }
+    clearConfirmPending = true;
+    clearChatBtn.classList.add('confirming');
+    clearChatBtn.title = 'Click again to confirm';
+    setTimeout(() => {
+      if (clearConfirmPending) {
+        clearConfirmPending = false;
+        clearChatBtn.classList.remove('confirming');
+        clearChatBtn.title = 'Clear chat';
+      }
+    }, 2500);
+  });
 
   let currentBubble = null;
   let currentRaw = '';

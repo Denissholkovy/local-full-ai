@@ -17,7 +17,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-username/local-ai-assistant.git"
+    "url": "https://github.com/Denissholkovy/local-full-ai"
   },
   "engines": {
     "vscode": "^1.85.0"
