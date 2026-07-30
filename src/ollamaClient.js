@@ -158,13 +158,21 @@ class OllamaClient {
     });
   }
 
-  chatStream(modelName, messages, onToken, onAbortReady) {
+  chatStream(modelName, messages, onToken, options = {}) {
+    const onAbortReady = typeof options === 'function' ? options : options.onAbortReady;
+    const keepAlive = typeof options === 'function' ? undefined : options.keepAlive;
+    const onStats = typeof options === 'function' ? undefined : options.onStats;
+
     return new Promise((resolve, reject) => {
-      const payload = JSON.stringify({
+      const payloadObj = {
         model: modelName,
         messages,
         stream: true
-      });
+      };
+      if (keepAlive !== undefined && keepAlive !== '') {
+        payloadObj.keep_alive = keepAlive;
+      }
+      const payload = JSON.stringify(payloadObj);
       const url = new URL(`${this.baseUrl}/api/chat`);
       let aborted = false;
       let fullText = '';
@@ -194,6 +202,14 @@ class OllamaClient {
                 if (evt.message && evt.message.content) {
                   fullText += evt.message.content;
                   if (onToken) onToken(evt.message.content);
+                }
+                if (evt.done && evt.eval_count && evt.eval_duration && onStats) {
+                  const tokensPerSec = evt.eval_count / (evt.eval_duration / 1e9);
+                  onStats({
+                    tokensPerSec,
+                    evalCount: evt.eval_count,
+                    evalDuration: evt.eval_duration
+                  });
                 }
               } catch (_) {
               }

@@ -47,12 +47,21 @@ class SidebarProvider {
         case 'openChat':
           await vscode.commands.executeCommand('localAI.openChat');
           break;
-        case 'askSelection':
-          await vscode.commands.executeCommand('localAI.askAboutSelection');
-          break;
         case 'manualModel':
           await this._promptManualModel();
           break;
+        case 'editSystemPrompt':
+          await this._promptSystemPrompt();
+          break;
+        case 'editKeepAlive':
+          await this._promptKeepAlive();
+          break;
+        case 'toggleIncludeActiveFile': {
+          const current = this._context.globalState.get('localAI.includeActiveFile', false);
+          await this._context.globalState.update('localAI.includeActiveFile', !current);
+          await this._refreshState();
+          break;
+        }
       }
     });
 
@@ -215,6 +224,36 @@ class SidebarProvider {
     }
   }
 
+  async _promptKeepAlive() {
+    const options = [
+      { label: '5m (default)', value: '' },
+      { label: '30m', value: '30m' },
+      { label: '1h', value: '1h' },
+      { label: 'Forever (stays loaded until you change it)', value: '-1' },
+      { label: 'Unload immediately after each reply', value: '0' }
+    ];
+    const picked = await vscode.window.showQuickPick(
+      options.map((o) => o.label),
+      { title: 'How long should Ollama keep the model loaded in RAM?' }
+    );
+    if (picked === undefined) return;
+    const match = options.find((o) => o.label === picked);
+    await this._context.globalState.update('localAI.keepAlive', match.value);
+    await this._refreshState();
+  }
+
+  async _promptSystemPrompt() {
+    const current = this._context.globalState.get('localAI.systemPrompt') || '';
+    const value = await vscode.window.showInputBox({
+      prompt: 'System prompt / persona (leave empty to remove)',
+      placeHolder: 'e.g. "Always answer with code only, no explanations"',
+      value: current
+    });
+    if (value === undefined) return;
+    await this._context.globalState.update('localAI.systemPrompt', value);
+    await this._refreshState();
+  }
+
   async _refreshState() {
     if (!this._view) return;
 
@@ -233,17 +272,38 @@ class SidebarProvider {
 
     const localNames = localModels.map((m) => m.name);
     const selectedModel = this._context.globalState.get('localAI.selectedModel') || null;
+    const systemPrompt = this._context.globalState.get('localAI.systemPrompt') || '';
+    const keepAlive = this._context.globalState.get('localAI.keepAlive') || '';
+    const includeActiveFile = this._context.globalState.get('localAI.includeActiveFile', false);
 
     this._view.webview.postMessage({
       type: 'ollamaReady',
       installedModels: localNames,
       recommendedModels: RECOMMENDED_MODELS,
-      selectedModel
+      selectedModel,
+      systemPrompt,
+      keepAlive,
+      includeActiveFile
     });
   }
 
   async _installModel(modelName) {
     if (!this._view || this._pullInProgress.has(modelName)) return;
+
+    const catalogEntry = RECOMMENDED_MODELS.find((m) => m.name === modelName);
+    if (catalogEntry && typeof catalogEntry.sizeGB === 'number') {
+      const os = require('os');
+      const totalRamGB = os.totalmem() / (1024 * 1024 * 1024);
+      if (catalogEntry.sizeGB > totalRamGB * 0.7) {
+        const choice = await vscode.window.showWarningMessage(
+          `This model needs about ${catalogEntry.sizeGB} GB, but your machine has ~${totalRamGB.toFixed(0)} GB of RAM total. It may run very slowly, swap heavily, or fail to load. Continue anyway?`,
+          { modal: true },
+          'Install anyway'
+        );
+        if (choice !== 'Install anyway') return;
+      }
+    }
+
     this._pullInProgress.add(modelName);
 
     this._view.webview.postMessage({ type: 'pullStart', modelName });
@@ -552,7 +612,18 @@ class SidebarProvider {
       if (state.selectedModel) {
         html += '<div class="box ok">${ICONS.check} Active model: <b>' + state.selectedModel + '</b></div>';
         html += '<button class="primary" id="btnChat">${ICONS.chat} Open chat</button>';
-        html += '<button id="btnAsk">${ICONS.scissors} Ask about selected code</button>';
+        html += '<button id="btnSystemPrompt">${ICONS.pencil} ' +
+          (state.systemPrompt ? 'Edit system prompt' : 'Set system prompt / persona') + '</button>';
+        if (state.systemPrompt) {
+          html += '<div class="box" style="font-size:11px;opacity:0.8;">"' +
+            (state.systemPrompt.length > 100 ? state.systemPrompt.slice(0, 100) + '...' : state.systemPrompt) +
+            '"</div>';
+        }
+        html += '<button id="btnKeepAlive">${ICONS.play} Keep model in RAM: ' +
+          (state.keepAlive || '5m (default)') + '</button>';
+        html += '<button id="btnIncludeActiveFile">' +
+          (state.includeActiveFile ? '${ICONS.check}' : '${ICONS.close}') +
+          ' Auto-include active file as context: ' + (state.includeActiveFile ? 'On' : 'Off') + '</button>';
 
         if (state.installedModels.length > 0) {
           html += '<h3>Quick switch</h3>';
@@ -678,8 +749,12 @@ class SidebarProvider {
 
       const chatBtn = document.getElementById('btnChat');
       if (chatBtn) chatBtn.onclick = () => send('openChat');
-      const askBtn = document.getElementById('btnAsk');
-      if (askBtn) askBtn.onclick = () => send('askSelection');
+      const sysPromptBtn = document.getElementById('btnSystemPrompt');
+      if (sysPromptBtn) sysPromptBtn.onclick = () => send('editSystemPrompt');
+      const keepAliveBtn = document.getElementById('btnKeepAlive');
+      if (keepAliveBtn) keepAliveBtn.onclick = () => send('editKeepAlive');
+      const includeFileBtn = document.getElementById('btnIncludeActiveFile');
+      if (includeFileBtn) includeFileBtn.onclick = () => send('toggleIncludeActiveFile');
       document.getElementById('btnManual').onclick = () => send('manualModel');
       document.getElementById('btnUninstall').onclick = () => send('uninstallOllama');
 
@@ -714,7 +789,9 @@ class SidebarProvider {
           view: 'ready',
           installedModels: msg.installedModels,
           recommendedModels: msg.recommendedModels,
-          selectedModel: msg.selectedModel
+          selectedModel: msg.selectedModel,
+          systemPrompt: msg.systemPrompt || '',
+          keepAlive: msg.keepAlive || ''
         };
         render();
         break;

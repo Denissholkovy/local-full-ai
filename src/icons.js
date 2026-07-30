@@ -7,7 +7,7 @@ const ICON_NAMES = [
   'box', 'chat', 'scissors', 'bolt', 'download', 'refresh', 'pencil',
   'trash', 'paperclip', 'send', 'stop', 'check', 'warning', 'eye',
   'eyeOff', 'image', 'fileText', 'copy', 'insert', 'close', 'play',
-  'chevronDown', 'chevronRight'
+  'chevronDown', 'chevronRight', 'list', 'plus'
 ];
 
 const ICONS = {};

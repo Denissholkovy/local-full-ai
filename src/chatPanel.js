@@ -11,6 +11,28 @@ const TEXT_FILE_EXTENSIONS = [
 ];
 const MAX_TEXT_FILE_CHARS = 12000;
 
+const MAX_CONTEXT_CHARS = 24000;
+
+function estimateChars(messages) {
+  return messages.reduce(
+    (sum, m) => sum + (typeof m.content === 'string' ? m.content.length : 0),
+    0
+  );
+}
+
+function trimMessagesToFit(messages, maxChars) {
+  const systemMsgs = messages.filter((m) => m.role === 'system');
+  const rest = messages.filter((m) => m.role !== 'system');
+  let trimmed = false;
+
+  while (estimateChars([...systemMsgs, ...rest]) > maxChars && rest.length > 2) {
+    rest.shift();
+    trimmed = true;
+  }
+
+  return { messages: [...systemMsgs, ...rest], trimmed };
+}
+
 const LANGUAGE_BY_EXTENSION = {
   '.js': 'javascript',
   '.ts': 'typescript',
@@ -43,7 +65,8 @@ class ChatPanel {
       { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
       {
         enableScripts: true,
-        retainContextWhenHidden: true
+        retainContextWhenHidden: true,
+        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')]
       }
     );
 
@@ -55,14 +78,29 @@ class ChatPanel {
     this._panel = panel;
     this._context = context;
     this._ollamaClient = ollamaClient;
-    this._history = [];
     this._currentAbort = null;
 
-    this._panel.webview.html = this._getHtml();
+    this._sessions = this._context.globalState.get('localAI.chatSessions', []);
+    if (!Array.isArray(this._sessions) || this._sessions.length === 0) {
+      this._sessions = [this._createSessionObject()];
+    }
+    let currentId = this._context.globalState.get('localAI.currentSessionId', null);
+    let currentSession = this._sessions.find((s) => s.id === currentId);
+    if (!currentSession) {
+      currentSession = this._sessions[this._sessions.length - 1];
+      currentId = currentSession.id;
+    }
+    this._currentSessionId = currentId;
+    this._history = currentSession.history;
+
+    const hljsUri = this._panel.webview.asWebviewUri(
+      vscode.Uri.joinPath(this._context.extensionUri, 'media', 'vendor', 'highlight.min.js')
+    );
+    this._panel.webview.html = this._getHtml(hljsUri);
 
     this._panel.webview.onDidReceiveMessage(async (msg) => {
       if (msg.type === 'send') {
-        await this._handleUserMessage(msg.text, msg.attachment);
+        await this._handleUserMessage(msg.text, msg.attachments);
       } else if (msg.type === 'copyToClipboard') {
         await vscode.env.clipboard.writeText(msg.text);
       } else if (msg.type === 'insertAtCursor') {
@@ -78,17 +116,110 @@ class ChatPanel {
         if (this._currentAbort) this._currentAbort();
       } else if (msg.type === 'ready') {
         this._sendModelInfo();
+        this._sendCurrentHistory();
       } else if (msg.type === 'startOllamaServer') {
         await this._startOllamaServer();
       } else if (msg.type === 'clearChat') {
-        this._history = [];
+        this._history.length = 0;
+        this._persistSessions();
         if (this._currentAbort) this._currentAbort();
+      } else if (msg.type === 'regenerate') {
+        await this._regenerate();
+      } else if (msg.type === 'listSessions') {
+        this._sendSessionsList();
+      } else if (msg.type === 'newChat') {
+        this._newChat();
+      } else if (msg.type === 'switchSession') {
+        this._switchSession(msg.id);
+      } else if (msg.type === 'deleteSession') {
+        this._deleteSession(msg.id);
       }
     });
 
     this._panel.onDidDispose(() => {
       ChatPanel.currentPanel = undefined;
     });
+  }
+
+  _createSessionObject() {
+    return {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+      title: 'New chat',
+      history: [],
+      updatedAt: Date.now()
+    };
+  }
+
+  _persistSessions() {
+    const session = this._sessions.find((s) => s.id === this._currentSessionId);
+    if (session) {
+      session.updatedAt = Date.now();
+      const firstUser = session.history.find((m) => m.role === 'user');
+      if (firstUser && session.title === 'New chat') {
+        const raw = typeof firstUser.content === 'string' ? firstUser.content : '';
+        session.title = raw.slice(0, 48) + (raw.length > 48 ? '...' : '');
+      }
+    }
+    this._context.globalState.update('localAI.chatSessions', this._sessions);
+    this._context.globalState.update('localAI.currentSessionId', this._currentSessionId);
+  }
+
+  _sendCurrentHistory() {
+    this._panel.webview.postMessage({
+      type: 'loadHistory',
+      history: this._history
+    });
+  }
+
+  _sendSessionsList() {
+    const list = this._sessions
+      .slice()
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .map((s) => ({ id: s.id, title: s.title, updatedAt: s.updatedAt, isCurrent: s.id === this._currentSessionId }));
+    this._panel.webview.postMessage({ type: 'sessionsList', sessions: list });
+  }
+
+  _newChat() {
+    if (this._currentAbort) this._currentAbort();
+    const session = this._createSessionObject();
+    this._sessions.push(session);
+    this._currentSessionId = session.id;
+    this._history = session.history;
+    this._persistSessions();
+    this._sendCurrentHistory();
+    this._sendModelInfo();
+  }
+
+  _switchSession(id) {
+    const session = this._sessions.find((s) => s.id === id);
+    if (!session) return;
+    if (this._currentAbort) this._currentAbort();
+    this._currentSessionId = id;
+    this._history = session.history;
+    this._context.globalState.update('localAI.currentSessionId', this._currentSessionId);
+    this._sendCurrentHistory();
+    this._sendModelInfo();
+  }
+
+  _deleteSession(id) {
+    const idx = this._sessions.findIndex((s) => s.id === id);
+    if (idx === -1) return;
+    this._sessions.splice(idx, 1);
+
+    if (this._sessions.length === 0) {
+      this._sessions = [this._createSessionObject()];
+    }
+
+    if (id === this._currentSessionId) {
+      const next = this._sessions[this._sessions.length - 1];
+      this._currentSessionId = next.id;
+      this._history = next.history;
+      this._sendCurrentHistory();
+      this._sendModelInfo();
+    }
+
+    this._persistSessions();
+    this._sendSessionsList();
   }
 
   async _startOllamaServer() {
@@ -145,7 +276,7 @@ class ChatPanel {
       : TEXT_FILE_EXTENSIONS;
 
     const uris = await vscode.window.showOpenDialog({
-      canSelectMany: false,
+      canSelectMany: true,
       openLabel: 'Attach',
       filters: {
         [kind === 'image' ? 'Images' : 'Text files']: extensions
@@ -153,43 +284,45 @@ class ChatPanel {
     });
     if (!uris || uris.length === 0) return;
 
-    const filePath = uris[0].fsPath;
-    const fileName = path.basename(filePath);
-    const ext = path.extname(filePath).toLowerCase();
+    for (const uri of uris) {
+      const filePath = uri.fsPath;
+      const fileName = path.basename(filePath);
+      const ext = path.extname(filePath).toLowerCase();
 
-    try {
-      if (IMAGE_EXTENSIONS.has(ext)) {
-        const buffer = fs.readFileSync(filePath);
-        const base64 = buffer.toString('base64');
-        const mime = ext === '.jpg' ? 'jpeg' : ext.slice(1);
-        this._panel.webview.postMessage({
-          type: 'fileAttached',
-          kind: 'image',
-          name: fileName,
-          base64,
-          dataUrl: `data:image/${mime};base64,${base64}`
-        });
-      } else {
-        let content = fs.readFileSync(filePath, 'utf8');
-        let truncated = false;
-        if (content.length > MAX_TEXT_FILE_CHARS) {
-          content = content.slice(0, MAX_TEXT_FILE_CHARS);
-          truncated = true;
+      try {
+        if (IMAGE_EXTENSIONS.has(ext)) {
+          const buffer = fs.readFileSync(filePath);
+          const base64 = buffer.toString('base64');
+          const mime = ext === '.jpg' ? 'jpeg' : ext.slice(1);
+          this._panel.webview.postMessage({
+            type: 'fileAttached',
+            kind: 'image',
+            name: fileName,
+            base64,
+            dataUrl: `data:image/${mime};base64,${base64}`
+          });
+        } else {
+          let content = fs.readFileSync(filePath, 'utf8');
+          let truncated = false;
+          if (content.length > MAX_TEXT_FILE_CHARS) {
+            content = content.slice(0, MAX_TEXT_FILE_CHARS);
+            truncated = true;
+          }
+          this._panel.webview.postMessage({
+            type: 'fileAttached',
+            kind: 'text',
+            name: fileName,
+            content,
+            truncated,
+            language: LANGUAGE_BY_EXTENSION[ext] || ''
+          });
         }
+      } catch (err) {
         this._panel.webview.postMessage({
-          type: 'fileAttached',
-          kind: 'text',
-          name: fileName,
-          content,
-          truncated,
-          language: LANGUAGE_BY_EXTENSION[ext] || ''
+          type: 'error',
+          text: `Could not read the file "${fileName}": ${err.message}`
         });
       }
-    } catch (err) {
-      this._panel.webview.postMessage({
-        type: 'error',
-        text: `Could not read the file: ${err.message}`
-      });
     }
   }
 
@@ -197,7 +330,7 @@ class ChatPanel {
     this._panel.webview.postMessage({ type: 'seed', text });
   }
 
-  async _handleUserMessage(text, attachment) {
+  async _handleUserMessage(text, attachments) {
     const modelName = this._context.globalState.get('localAI.selectedModel');
     if (!modelName) {
       this._panel.webview.postMessage({
@@ -208,30 +341,86 @@ class ChatPanel {
     }
 
     const userMessage = { role: 'user', content: text };
+    const contentParts = [];
 
-    if (attachment && attachment.kind === 'text') {
-      const lang = attachment.language || '';
-      userMessage.content =
-        `File: ${attachment.name}\n\`\`\`${lang}\n${attachment.content}\n\`\`\`\n\n${text}`;
-    } else if (attachment && attachment.kind === 'image') {
-      userMessage.images = [attachment.base64];
+    const includeActiveFile = this._context.globalState.get('localAI.includeActiveFile', false);
+    if (includeActiveFile) {
+      const editor = vscode.window.activeTextEditor;
+      if (editor) {
+        const fileName = path.basename(editor.document.fileName);
+        let fileText = editor.document.getText();
+        let truncated = false;
+        if (fileText.length > MAX_TEXT_FILE_CHARS) {
+          fileText = fileText.slice(0, MAX_TEXT_FILE_CHARS);
+          truncated = true;
+        }
+        const lang = editor.document.languageId || '';
+        contentParts.push(
+          `Active file (${fileName}${truncated ? ', truncated' : ''}):\n\`\`\`${lang}\n${fileText}\n\`\`\``
+        );
+      }
     }
 
+    const attachmentList = Array.isArray(attachments) ? attachments : (attachments ? [attachments] : []);
+
+    if (attachmentList.length > 0) {
+      const imageBase64s = [];
+      attachmentList.forEach((att) => {
+        if (att.kind === 'text') {
+          const lang = att.language || '';
+          contentParts.push(`File: ${att.name}\n\`\`\`${lang}\n${att.content}\n\`\`\``);
+        } else if (att.kind === 'image') {
+          imageBase64s.push(att.base64);
+        }
+      });
+      if (imageBase64s.length > 0) {
+        userMessage.images = imageBase64s;
+      }
+    }
+
+    contentParts.push(text);
+    userMessage.content = contentParts.join('\n\n');
+
     this._history.push(userMessage);
+    this._persistSessions();
     this._panel.webview.postMessage({
       type: 'userMessage',
       text,
-      attachment: attachment
-        ? {
-            kind: attachment.kind,
-            name: attachment.name,
-            dataUrl: attachment.dataUrl,
-            content: attachment.content,
-            language: attachment.language,
-            truncated: attachment.truncated
-          }
-        : null
+      includedActiveFile: includeActiveFile && !!vscode.window.activeTextEditor,
+      attachments: attachmentList.map((att) => ({
+        kind: att.kind,
+        name: att.name,
+        dataUrl: att.dataUrl,
+        content: att.content,
+        language: att.language,
+        truncated: att.truncated
+      }))
     });
+
+    await this._streamAssistantReply(modelName);
+  }
+
+  async _regenerate() {
+    const modelName = this._context.globalState.get('localAI.selectedModel');
+    if (!modelName) {
+      this._panel.webview.postMessage({
+        type: 'error',
+        text: 'Pick a model in the Local Full AI sidebar first.'
+      });
+      return;
+    }
+
+    if (
+      this._history.length > 0 &&
+      this._history[this._history.length - 1].role === 'assistant'
+    ) {
+      this._history.pop();
+    }
+
+    await this._streamAssistantReply(modelName);
+  }
+
+  async _streamAssistantReply(modelName) {
     this._panel.webview.postMessage({
       type: 'assistantStart',
       modelName,
@@ -239,18 +428,40 @@ class ChatPanel {
     });
 
     try {
+      const systemPrompt = this._context.globalState.get('localAI.systemPrompt') || '';
+      const messagesToSend = systemPrompt
+        ? [{ role: 'system', content: systemPrompt }, ...this._history]
+        : this._history;
+
+      const { messages: trimmedMessages, trimmed } = trimMessagesToFit(messagesToSend, MAX_CONTEXT_CHARS);
+      if (trimmed) {
+        this._panel.webview.postMessage({
+          type: 'contextTrimmed',
+          text: 'This conversation got long - older messages were trimmed to fit the model\'s context window.'
+        });
+      }
+
+      const keepAlive = this._context.globalState.get('localAI.keepAlive') || undefined;
+
       const fullReply = await this._ollamaClient.chatStream(
         modelName,
-        this._history,
+        trimmedMessages,
         (token) => {
           this._panel.webview.postMessage({ type: 'assistantToken', text: token });
         },
-        (abortFn) => {
-          this._currentAbort = abortFn;
+        {
+          onAbortReady: (abortFn) => {
+            this._currentAbort = abortFn;
+          },
+          keepAlive,
+          onStats: (stats) => {
+            this._panel.webview.postMessage({ type: 'generationStats', stats });
+          }
         }
       );
       this._currentAbort = null;
       this._history.push({ role: 'assistant', content: fullReply });
+      this._persistSessions();
       this._panel.webview.postMessage({ type: 'assistantEnd' });
     } catch (err) {
       this._currentAbort = null;
@@ -265,7 +476,7 @@ class ChatPanel {
     }
   }
 
-  _getHtml() {
+  _getHtml(hljsUri) {
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -335,6 +546,79 @@ class ChatPanel {
     color: white;
   }
 
+  #historyBtn, #newChatBtn {
+    background: transparent;
+    border: none;
+    color: var(--vscode-descriptionForeground);
+    cursor: pointer;
+    padding: 3px 5px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+  }
+  #historyBtn:hover, #newChatBtn:hover {
+    background: rgba(127,127,127,0.2);
+    color: var(--vscode-editor-foreground);
+  }
+
+  #historyDropdown {
+    position: absolute;
+    top: 42px;
+    left: 10px;
+    width: 280px;
+    max-height: 340px;
+    overflow-y: auto;
+    background: var(--vscode-editorWidget-background);
+    border: 1px solid var(--vscode-widget-border);
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    z-index: 20;
+    padding: 6px;
+  }
+  .session-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12.5px;
+  }
+  .session-item:hover {
+    background: rgba(127,127,127,0.15);
+  }
+  .session-item.current {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+  }
+  .session-item .session-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .session-item .session-delete {
+    background: transparent;
+    border: none;
+    color: inherit;
+    opacity: 0.5;
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+  }
+  .session-item .session-delete:hover {
+    opacity: 1;
+    background: rgba(244,71,71,0.25);
+  }
+  .session-empty {
+    padding: 10px;
+    font-size: 12px;
+    opacity: 0.6;
+    text-align: center;
+  }
+
   #messages {
     flex: 1;
     overflow-y: auto;
@@ -362,6 +646,7 @@ class ChatPanel {
   }
   .row.user .message-col { align-items: flex-end; }
   .row.assistant .message-col { align-items: flex-start; }
+  .row.notice .message-col { align-items: center; }
 
   .msg-actions {
     display: flex;
@@ -411,6 +696,21 @@ class ChatPanel {
     background: rgba(244, 71, 71, 0.12);
     border: 1px solid var(--vscode-errorForeground);
     color: var(--vscode-errorForeground);
+  }
+  .row.notice {
+    justify-content: center;
+  }
+  .row.notice .bubble {
+    background: transparent;
+    border: 1px dashed var(--vscode-widget-border);
+    color: var(--vscode-descriptionForeground);
+    font-size: 11.5px;
+    padding: 6px 12px;
+  }
+  .gen-stats {
+    font-size: 10.5px;
+    opacity: 0.5;
+    padding: 0 4px;
   }
 
   .bubble p { margin: 0 0 8px 0; }
@@ -478,6 +778,68 @@ class ChatPanel {
     color: var(--vscode-editor-foreground);
     background: transparent;
   }
+
+  /* Syntax highlighting token colors - two palettes chosen to resemble the
+     default VS Code Dark+/Light+ themes. VS Code adds a vscode-dark or
+     vscode-light class to the webview body automatically. */
+  body.vscode-dark .hljs-keyword,
+  body.vscode-dark .hljs-literal,
+  body.vscode-dark .hljs-selector-tag,
+  body.vscode-dark .hljs-tag,
+  body.vscode-dark .hljs-name { color: #569cd6; }
+  body.vscode-dark .hljs-string,
+  body.vscode-dark .hljs-regexp { color: #ce9178; }
+  body.vscode-dark .hljs-number { color: #b5cea8; }
+  body.vscode-dark .hljs-comment,
+  body.vscode-dark .hljs-quote { color: #6a9955; font-style: italic; }
+  body.vscode-dark .hljs-title,
+  body.vscode-dark .hljs-title.function_,
+  body.vscode-dark .hljs-section { color: #dcdcaa; }
+  body.vscode-dark .hljs-built_in,
+  body.vscode-dark .hljs-type,
+  body.vscode-dark .hljs-class .hljs-title { color: #4ec9b0; }
+  body.vscode-dark .hljs-attr,
+  body.vscode-dark .hljs-attribute,
+  body.vscode-dark .hljs-variable,
+  body.vscode-dark .hljs-template-variable,
+  body.vscode-dark .hljs-meta { color: #9cdcfe; }
+  body.vscode-dark .hljs-symbol,
+  body.vscode-dark .hljs-bullet,
+  body.vscode-dark .hljs-link { color: #d7ba7d; }
+  body.vscode-dark .hljs-deletion { color: #f48771; }
+  body.vscode-dark .hljs-addition { color: #b5cea8; }
+  body.vscode-dark .hljs-emphasis { font-style: italic; }
+  body.vscode-dark .hljs-strong { font-weight: bold; }
+
+  body.vscode-light .hljs-keyword,
+  body.vscode-light .hljs-literal,
+  body.vscode-light .hljs-selector-tag,
+  body.vscode-light .hljs-tag,
+  body.vscode-light .hljs-name { color: #0000ff; }
+  body.vscode-light .hljs-string,
+  body.vscode-light .hljs-regexp { color: #a31515; }
+  body.vscode-light .hljs-number { color: #098658; }
+  body.vscode-light .hljs-comment,
+  body.vscode-light .hljs-quote { color: #008000; font-style: italic; }
+  body.vscode-light .hljs-title,
+  body.vscode-light .hljs-title.function_,
+  body.vscode-light .hljs-section { color: #795e26; }
+  body.vscode-light .hljs-built_in,
+  body.vscode-light .hljs-type,
+  body.vscode-light .hljs-class .hljs-title { color: #267f99; }
+  body.vscode-light .hljs-attr,
+  body.vscode-light .hljs-attribute,
+  body.vscode-light .hljs-variable,
+  body.vscode-light .hljs-template-variable,
+  body.vscode-light .hljs-meta { color: #001080; }
+  body.vscode-light .hljs-symbol,
+  body.vscode-light .hljs-bullet,
+  body.vscode-light .hljs-link { color: #a31515; }
+  body.vscode-light .hljs-deletion { color: #a31515; }
+  body.vscode-light .hljs-addition { color: #098658; }
+  body.vscode-light .hljs-emphasis { font-style: italic; }
+  body.vscode-light .hljs-strong { font-weight: bold; }
+
 
   .typing-dot {
     display: inline-block;
@@ -566,27 +928,34 @@ class ChatPanel {
 
   #attachmentPreview {
     display: none;
-    align-items: center;
-    gap: 8px;
+    flex-wrap: wrap;
+    gap: 6px;
     padding: 6px 10px;
     margin: 0 10px;
+  }
+  #attachmentPreview.has-items { display: flex; }
+  .attach-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px;
     border-radius: 6px;
     background: var(--vscode-textBlockQuote-background);
-    font-size: 12px;
+    font-size: 11.5px;
   }
-  #attachmentPreview img {
-    width: 32px;
-    height: 32px;
+  .attach-chip img {
+    width: 24px;
+    height: 24px;
     object-fit: cover;
     border-radius: 4px;
   }
-  #attachmentPreview .attach-name { flex: 1; opacity: 0.9; }
-  #attachmentPreview button {
+  .attach-chip .attach-name { opacity: 0.9; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .attach-chip button {
     background: transparent;
     border: none;
     color: var(--vscode-descriptionForeground);
     cursor: pointer;
-    padding: 0 4px;
+    padding: 0 2px;
     display: flex;
     align-items: center;
   }
@@ -615,18 +984,19 @@ class ChatPanel {
 </head>
 <body>
   <div id="header">
+    <button id="historyBtn" title="Chat history">${ICONS.list}</button>
     <span class="title">${ICONS.chat} Local Full AI Chat</span>
     <div id="headerRight">
       <span id="modelBadge" style="display:none;"></span>
+      <button id="newChatBtn" title="New chat">${ICONS.plus}</button>
       <button id="clearChatBtn" title="Clear chat">${ICONS.trash}</button>
     </div>
   </div>
-  <div id="messages"></div>
-  <div id="attachmentPreview">
-    <img id="attachmentThumb" style="display:none;" />
-    <span class="attach-name" id="attachmentName"></span>
-    <button id="attachmentRemove">${ICONS.close}</button>
+  <div id="historyDropdown" style="display:none;">
+    <div id="historyList"></div>
   </div>
+  <div id="messages"></div>
+  <div id="attachmentPreview"></div>
   <div id="inputBar">
     <button id="attachImageBtn" title="Attach an image (vision models only)" style="display:none;">${ICONS.image}</button>
     <button id="attachBtn" title="Attach a text file">${ICONS.paperclip}</button>
@@ -635,7 +1005,9 @@ class ChatPanel {
     <button id="sendBtn" title="Send">${ICONS.send}</button>
   </div>
 
+<script src="${hljsUri}"></script>
 <script>
+  const hljs = (typeof hljsModule !== 'undefined') ? hljsModule.default : null;
   const vscode = acquireVsCodeApi();
   const messagesEl = document.getElementById('messages');
   const input = document.getElementById('input');
@@ -644,11 +1016,87 @@ class ChatPanel {
   const attachBtn = document.getElementById('attachBtn');
   const attachImageBtn = document.getElementById('attachImageBtn');
   const attachmentPreview = document.getElementById('attachmentPreview');
-  const attachmentThumb = document.getElementById('attachmentThumb');
-  const attachmentName = document.getElementById('attachmentName');
-  const attachmentRemove = document.getElementById('attachmentRemove');
   const modelBadge = document.getElementById('modelBadge');
   const clearChatBtn = document.getElementById('clearChatBtn');
+  const historyBtn = document.getElementById('historyBtn');
+  const newChatBtn = document.getElementById('newChatBtn');
+  const historyDropdown = document.getElementById('historyDropdown');
+  const historyList = document.getElementById('historyList');
+
+  historyBtn.addEventListener('click', () => {
+    const willShow = historyDropdown.style.display === 'none';
+    historyDropdown.style.display = willShow ? 'block' : 'none';
+    if (willShow) {
+      vscode.postMessage({ type: 'listSessions' });
+    }
+  });
+
+  document.addEventListener('click', (e) => {
+    if (historyDropdown.style.display === 'none') return;
+    if (!historyDropdown.contains(e.target) && !historyBtn.contains(e.target)) {
+      historyDropdown.style.display = 'none';
+    }
+  });
+
+  newChatBtn.addEventListener('click', () => {
+    historyDropdown.style.display = 'none';
+    vscode.postMessage({ type: 'newChat' });
+  });
+
+  function renderSessionsList(sessions) {
+    if (!sessions || sessions.length === 0) {
+      historyList.innerHTML = '<div class="session-empty">No saved chats yet</div>';
+      return;
+    }
+    let html = '';
+    sessions.forEach((s) => {
+      html += '<div class="session-item' + (s.isCurrent ? ' current' : '') + '" data-session-id="' + s.id + '">' +
+        '<span class="session-title">' + escapeHtml(s.title || 'New chat') + '</span>' +
+        '<button class="session-delete" data-delete-session="' + s.id + '" title="Delete chat">' + ${JSON.stringify(ICONS.trash)} + '</button>' +
+      '</div>';
+    });
+    historyList.innerHTML = html;
+
+    historyList.querySelectorAll('.session-item').forEach((item) => {
+      item.addEventListener('click', (e) => {
+        if (e.target.closest('.session-delete')) return;
+        const id = item.getAttribute('data-session-id');
+        historyDropdown.style.display = 'none';
+        vscode.postMessage({ type: 'switchSession', id });
+      });
+    });
+    historyList.querySelectorAll('.session-delete').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const id = btn.getAttribute('data-delete-session');
+        vscode.postMessage({ type: 'deleteSession', id });
+      });
+    });
+  }
+
+  function renderLoadedHistory(history) {
+    messagesEl.innerHTML = '';
+    currentBubble = null;
+    currentRaw = '';
+    lastAssistantRegenerateBtn = null;
+
+    let lastAssistantRow = null;
+    (history || []).forEach((m) => {
+      if (m.role === 'system') return;
+      if (m.role === 'user') {
+        addRow(escapeHtml(m.content || '').replace(/\\n/g, '<br>'), 'user', m.content || '');
+      } else if (m.role === 'assistant') {
+        const bubble = addRow(renderMarkdown(m.content || ''), 'assistant', m.content || '');
+        attachCodeBlockActions(bubble);
+        highlightCodeBlocks(bubble);
+        lastAssistantRow = bubble.closest('.row');
+      }
+    });
+    if (lastAssistantRow) {
+      addRegenerateButton(lastAssistantRow);
+    }
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
 
   let clearConfirmPending = false;
 
@@ -659,7 +1107,8 @@ class ChatPanel {
     messagesEl.innerHTML = '';
     currentBubble = null;
     currentRaw = '';
-    pendingAttachment = null;
+    pendingAttachments = [];
+    lastAssistantRegenerateBtn = null;
     clearAttachment();
     setGeneratingUI(false);
     vscode.postMessage({ type: 'clearChat' });
@@ -686,14 +1135,45 @@ class ChatPanel {
 
   let currentBubble = null;
   let currentRaw = '';
-  let pendingAttachment = null; // { kind, name, base64?, dataUrl?, content?, language?, truncated? }
+  let pendingAttachments = [];
+  let lastAssistantRegenerateBtn = null;
+  let lastGenStats = null;
   let isGenerating = false;
   let stoppedByUser = false;
 
+  function renderAttachmentPreview() {
+    if (pendingAttachments.length === 0) {
+      attachmentPreview.classList.remove('has-items');
+      attachmentPreview.innerHTML = '';
+      return;
+    }
+    attachmentPreview.classList.add('has-items');
+    attachmentPreview.innerHTML = pendingAttachments
+      .map((att, idx) => {
+        const thumb = att.kind === 'image'
+          ? '<img src="' + att.dataUrl + '" />'
+          : ${JSON.stringify(ICONS.fileText)};
+        const label = att.name + (att.truncated ? ' (truncated)' : '');
+        return '<span class="attach-chip" data-idx="' + idx + '">' +
+          thumb +
+          '<span class="attach-name">' + escapeHtml(label) + '</span>' +
+          '<button data-remove-idx="' + idx + '">' + ${JSON.stringify(ICONS.close)} + '</button>' +
+        '</span>';
+      })
+      .join('');
+
+    attachmentPreview.querySelectorAll('button[data-remove-idx]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const idx = parseInt(btn.getAttribute('data-remove-idx'), 10);
+        pendingAttachments.splice(idx, 1);
+        renderAttachmentPreview();
+      });
+    });
+  }
+
   function clearAttachment() {
-    pendingAttachment = null;
-    attachmentPreview.style.display = 'none';
-    attachmentThumb.style.display = 'none';
+    pendingAttachments = [];
+    renderAttachmentPreview();
   }
 
   attachBtn.addEventListener('click', () => {
@@ -703,7 +1183,6 @@ class ChatPanel {
     vscode.postMessage({ type: 'attachFile', kind: 'image' });
   });
 
-  attachmentRemove.addEventListener('click', clearAttachment);
 
   function setGeneratingUI(active) {
     isGenerating = active;
@@ -779,9 +1258,27 @@ class ChatPanel {
             '<button data-action="insert" data-target="' + codeId + '">' + ${JSON.stringify(ICONS.insert)} + ' Insert</button>' +
           '</span>' +
         '</div>' +
-        '<pre><code id="' + codeId + '">' + escapeHtml(code) + '</code></pre>' +
+        '<pre><code id="' + codeId + '" data-lang="' + (lang || '') + '">' + escapeHtml(code) + '</code></pre>' +
       '</div>'
     );
+  }
+
+  function highlightCodeBlocks(container) {
+    if (!hljs) return;
+    container.querySelectorAll('pre code[data-lang]').forEach((el) => {
+      const lang = el.getAttribute('data-lang');
+      try {
+        if (lang && hljs.getLanguage(lang)) {
+          const result = hljs.highlight(el.textContent, { language: lang, ignoreIllegals: true });
+          el.innerHTML = result.value;
+        } else {
+          const result = hljs.highlightAuto(el.textContent);
+          el.innerHTML = result.value;
+        }
+        el.classList.add('hljs');
+      } catch (_) {
+      }
+    });
   }
 
   function attachCodeBlockActions(container) {
@@ -850,10 +1347,39 @@ class ChatPanel {
     }
 
     row.appendChild(col);
+    const wasNearBottom = isNearBottom();
     messagesEl.appendChild(row);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (wasNearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
     attachCodeBlockActions(bubble);
+    highlightCodeBlocks(bubble);
     return bubble;
+  }
+
+  function isNearBottom() {
+    const threshold = 80;
+    return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < threshold;
+  }
+
+  function addRegenerateButton(row) {
+    if (lastAssistantRegenerateBtn) {
+      lastAssistantRegenerateBtn.remove();
+      lastAssistantRegenerateBtn = null;
+    }
+    const actionsEl = row.querySelector('.msg-actions');
+    if (!actionsEl) return;
+
+    const btn = document.createElement('button');
+    btn.setAttribute('data-msg-action', 'regenerate');
+    btn.title = 'Regenerate';
+    btn.innerHTML = ${JSON.stringify(ICONS.refresh)};
+    btn.onclick = () => {
+      if (isGenerating) return;
+      row.remove();
+      lastAssistantRegenerateBtn = null;
+      vscode.postMessage({ type: 'regenerate' });
+    };
+    actionsEl.appendChild(btn);
+    lastAssistantRegenerateBtn = btn;
   }
 
   function autoResize() {
@@ -867,21 +1393,19 @@ class ChatPanel {
     stoppedByUser = false;
 
     const text = input.value.trim();
-    if (!text && !pendingAttachment) return;
+    if (!text && pendingAttachments.length === 0) return;
 
-    const attachmentToSend = pendingAttachment
-      ? {
-          kind: pendingAttachment.kind,
-          name: pendingAttachment.name,
-          base64: pendingAttachment.base64,
-          content: pendingAttachment.content,
-          dataUrl: pendingAttachment.dataUrl,
-          language: pendingAttachment.language,
-          truncated: pendingAttachment.truncated
-        }
-      : null;
+    const attachmentsToSend = pendingAttachments.map((att) => ({
+      kind: att.kind,
+      name: att.name,
+      base64: att.base64,
+      content: att.content,
+      dataUrl: att.dataUrl,
+      language: att.language,
+      truncated: att.truncated
+    }));
 
-    vscode.postMessage({ type: 'send', text: text, attachment: attachmentToSend });
+    vscode.postMessage({ type: 'send', text: text, attachments: attachmentsToSend });
     input.value = '';
     clearAttachment();
     autoResize();
@@ -904,15 +1428,25 @@ class ChatPanel {
         input.focus();
         break;
       case 'userMessage': {
+        if (lastAssistantRegenerateBtn) {
+          lastAssistantRegenerateBtn.remove();
+          lastAssistantRegenerateBtn = null;
+        }
         let html = '';
-        if (msg.attachment) {
-          if (msg.attachment.kind === 'image') {
-            html += '<div class="msg-attachment"><img src="' + msg.attachment.dataUrl + '" /></div>';
-          } else {
-            html += '<div class="msg-attachment">' +
-              buildCodeBlock(msg.attachment.language || '', msg.attachment.content || '') +
-            '</div>';
-          }
+        if (msg.includedActiveFile) {
+          html += '<div class="msg-attachment"><span class="file-chip">' +
+            ${JSON.stringify(ICONS.fileText)} + ' active file included</span></div>';
+        }
+        if ((msg.attachments || []).length > 0) {
+          msg.attachments.forEach((att) => {
+            if (att.kind === 'image') {
+              html += '<div class="msg-attachment"><img src="' + att.dataUrl + '" /></div>';
+            } else {
+              html += '<div class="msg-attachment">' +
+                buildCodeBlock(att.language || '', att.content || '') +
+              '</div>';
+            }
+          });
         }
         if (msg.text) {
           html += escapeHtml(msg.text).replace(/\\n/g, '<br>');
@@ -936,11 +1470,13 @@ class ChatPanel {
       case 'assistantToken':
         if (stoppedByUser) break;
         if (currentBubble) {
+          const wasNearBottom = isNearBottom();
           currentRaw += msg.text;
           currentBubble.innerHTML = renderMarkdown(currentRaw);
           currentBubble.closest('.row').dataset.rawText = currentRaw;
           attachCodeBlockActions(currentBubble);
-          messagesEl.scrollTop = messagesEl.scrollHeight;
+          highlightCodeBlocks(currentBubble);
+          if (wasNearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
         }
         break;
       case 'assistantEnd':
@@ -949,7 +1485,16 @@ class ChatPanel {
           break;
         }
         if (currentBubble) {
-          currentBubble.closest('.row').dataset.rawText = currentRaw;
+          const row = currentBubble.closest('.row');
+          row.dataset.rawText = currentRaw;
+          addRegenerateButton(row);
+          if (lastGenStats) {
+            const statsEl = document.createElement('div');
+            statsEl.className = 'gen-stats';
+            statsEl.textContent = lastGenStats.tokensPerSec.toFixed(1) + ' tok/s';
+            row.querySelector('.message-col').appendChild(statsEl);
+            lastGenStats = null;
+          }
         }
         currentBubble = null;
         currentRaw = '';
@@ -984,18 +1529,23 @@ class ChatPanel {
         addRow(escapeHtml(msg.text), msg.ok ? 'assistant' : 'error');
         break;
       case 'fileAttached':
-        pendingAttachment = msg;
-        attachmentPreview.style.display = 'flex';
-        attachmentName.textContent = msg.name + (msg.truncated ? ' (truncated)' : '');
-        if (msg.kind === 'image') {
-          attachmentThumb.src = msg.dataUrl;
-          attachmentThumb.style.display = 'block';
-        } else {
-          attachmentThumb.style.display = 'none';
-        }
+        pendingAttachments.push(msg);
+        renderAttachmentPreview();
         break;
       case 'modelInfo':
         attachImageBtn.style.display = msg.supportsVision ? 'flex' : 'none';
+        break;
+      case 'generationStats':
+        lastGenStats = msg.stats;
+        break;
+      case 'contextTrimmed':
+        addRow(escapeHtml(msg.text), 'notice');
+        break;
+      case 'sessionsList':
+        renderSessionsList(msg.sessions);
+        break;
+      case 'loadHistory':
+        renderLoadedHistory(msg.history);
         break;
     }
   });
