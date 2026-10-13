@@ -2,8 +2,8 @@
   "name": "local-full-ai",
   "displayName": "Local Full AI",
   "publisher": "Denys-Shovkovyi",
-  "description": "Local Full AI assistant for VS Code, powered by Ollama. Runs fully offline once a model is downloaded.",
-  "version": "0.0.5",
+  "description": "A private, fully local AI coding assistant for VS Code, powered by Ollama: chat, edit your project with approval, autopilot, helper agents, voice input and model management. No account, no cloud.",
+  "version": "0.1.0",
   "license": "MIT",
   "icon": "media/icon.png",
   "keywords": [
@@ -13,7 +13,13 @@
     "offline",
     "llm",
     "chat",
-    "coding assistant"
+    "coding assistant",
+    "agent",
+    "autopilot",
+    "private",
+    "qwen",
+    "whisper",
+    "skills"
   ],
   "repository": {
     "type": "git",
@@ -79,6 +85,136 @@
           "default": "http://localhost:11434",
           "description": "Address of the local Ollama server"
         },
+        "localAI.useClaudeSkills": {
+          "type": "boolean",
+          "default": true,
+          "description": "Load your Claude skills (~/.claude/skills and <project>/.claude/skills) and CLAUDE.md files into the chat. Use /skill-name in the chat or let the model pick one."
+        },
+        "localAI.extraSkillFolders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra folders that contain skills (each skill is a subfolder with a SKILL.md)."
+        },
+        "localAI.responseMode": {
+          "type": "string",
+          "enum": [
+            "precise",
+            "balanced",
+            "creative",
+            "custom"
+          ],
+          "default": "precise",
+          "description": "How the model answers. Precise (low temperature) is the most reliable for code and tool use."
+        },
+        "localAI.temperature": {
+          "type": "number",
+          "default": 0.2,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Randomness for the Custom response mode."
+        },
+        "localAI.topP": {
+          "type": "number",
+          "default": 0.9,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Nucleus sampling for the Custom response mode."
+        },
+        "localAI.topK": {
+          "type": "number",
+          "default": 40,
+          "minimum": 0,
+          "description": "Top-K sampling for the Custom response mode."
+        },
+        "localAI.repeatPenalty": {
+          "type": "number",
+          "default": 1.05,
+          "minimum": 0.5,
+          "maximum": 2,
+          "description": "Repeat penalty for the Custom response mode."
+        },
+        "localAI.gpuLayers": {
+          "type": "number",
+          "default": -1,
+          "description": "How many model layers run on the GPU. -1 = automatic, 0 = CPU only."
+        },
+        "localAI.folderAccess": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Absolute folder path"
+              },
+              "level": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "read",
+                  "ask",
+                  "full"
+                ],
+                "description": "none = hidden, read = read only, ask = every edit/command needs approval, full = follows the permission mode"
+              }
+            },
+            "required": [
+              "path",
+              "level"
+            ]
+          },
+          "description": "Folders the AI may use and how far it may go in each. The deepest matching folder wins. Project folders default to full."
+        },
+        "localAI.workingFolder": {
+          "type": "string",
+          "default": "",
+          "description": "Folder the AI works from (relative paths and commands). Empty means the open project folder."
+        },
+        "localAI.unloadModelsOnClose": {
+          "type": "boolean",
+          "default": true,
+          "description": "When VS Code closes, unload the models from RAM if Ollama was started by something other than this extension. A server started by this extension is stopped completely."
+        },
+        "localAI.autoSkills": {
+          "type": "boolean",
+          "default": true,
+          "description": "Pick the skills that match each request and give them to the model directly, so skills work with every model (no tool calling needed)."
+        },
+        "localAI.multiAgent": {
+          "type": "boolean",
+          "default": true,
+          "description": "Let the main chat start helper agents (delegate_task) for research and sub-tasks."
+        },
+        "localAI.subagentModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model for research helper agents. Empty = same as the chat, \"auto\" = the smallest installed model, or an exact model name. A small model is fast for simple reading tasks; helpers that edit files always use the chat model."
+        },
+        "localAI.voiceLanguage": {
+          "type": "string",
+          "default": "auto",
+          "description": "Language for voice input (whisper language code such as en, uk, ru) or auto to detect."
+        },
+        "localAI.whisperBinaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to whisper-cli (whisper.cpp). Empty means search PATH and Homebrew."
+        },
+        "localAI.whisperModelPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a whisper.cpp ggml model. Empty means ~/.local-full-ai/whisper/ggml-base.bin."
+        },
+        "localAI.contextSize": {
+          "type": "number",
+          "default": 16384,
+          "minimum": 2048,
+          "description": "Context window (tokens) requested from Ollama. Larger values remember more of the project but use more RAM."
+        },
         "localAI.selectedModel": {
           "type": "string",
           "default": "",
@@ -92,5 +228,23 @@
   },
   "devDependencies": {
     "@types/vscode": "^1.85.0"
+  },
+  "homepage": "https://github.com/Denissholkovy/local-full-ai#readme",
+  "bugs": {
+    "url": "https://github.com/Denissholkovy/local-full-ai/issues"
+  },
+  "galleryBanner": {
+    "color": "#1e1b4b",
+    "theme": "dark"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In Restricted Mode the AI can only chat. It cannot read, edit or run anything in your folder."
+    },
+    "virtualWorkspaces": {
+      "supported": "limited",
+      "description": "Project tools (reading, editing, commands) need a real folder on disk; the chat itself works everywhere."
+    }
   }
 }

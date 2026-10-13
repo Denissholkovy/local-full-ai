@@ -1,7 +1,15 @@
 const vscode = require('vscode');
+const modelState = require('./modelState');
 const { RECOMMENDED_MODELS } = require('./modelPicker');
 const { ICONS } = require('./icons');
 const ollamaProcess = require('./ollamaProcess');
+const skillsLib = require('./skills');
+const voice = require('./voice');
+const modelTags = require('./modelTags');
+const generationLib = require('./generation');
+const hardware = require('./hardware');
+const workspaceLib = require('./workspace');
+const { resolveWorkspaceRoot } = workspaceLib;
 
 class SidebarProvider {
   constructor(context, ollamaClient) {
@@ -9,11 +17,15 @@ class SidebarProvider {
     this._ollamaClient = ollamaClient;
     this._view = null;
     this._pullInProgress = new Set();
+    this._pullAborts = new Map();
   }
 
   resolveWebviewView(webviewView) {
     this._view = webviewView;
-    webviewView.webview.options = { enableScripts: true };
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this._context.extensionUri, 'media')]
+    };
     webviewView.webview.html = this._getHtml();
 
     webviewView.webview.onDidReceiveMessage(async (msg) => {
@@ -38,7 +50,7 @@ class SidebarProvider {
           await this._installModel(msg.modelName);
           break;
         case 'selectInstalledModel':
-          await this._context.globalState.update('localAI.selectedModel', msg.modelName);
+          await modelState.setSelectedModel(this._context, msg.modelName);
           await this._refreshState();
           break;
         case 'deleteModel':
@@ -56,6 +68,78 @@ class SidebarProvider {
         case 'editKeepAlive':
           await this._promptKeepAlive();
           break;
+        case 'setFolderLevel':
+          await this._setFolderLevel(msg.path, msg.level);
+          break;
+        case 'addAccessFolder':
+          await this._addAccessFolder();
+          break;
+        case 'removeAccessFolder':
+          await this._updateRules((raw) => raw.filter((r) => workspaceLib.normalize(workspaceLib.expandHome(r.path)) !== msg.path));
+          break;
+        case 'setWorkingFolder': {
+          const known = this._folderState().items.some((i) => i.path === msg.path);
+          const value = msg.path && known ? msg.path : '';
+          await vscode.workspace.getConfiguration('localAI').update('workingFolder', value, vscode.ConfigurationTarget.Global);
+          break;
+        }
+        case 'cancelPull': {
+          const abort = this._pullAborts.get(msg.modelName);
+          if (abort) abort();
+          break;
+        }
+        case 'chooseVariant':
+          await this._chooseVariant(msg.modelName);
+          break;
+        case 'chooseResponseMode':
+          await this._chooseResponseMode();
+          break;
+        case 'chooseContext':
+          await this._chooseContext();
+          break;
+        case 'chooseGpu':
+          await this._chooseGpu();
+          break;
+        case 'chooseHelperModel':
+          await this._chooseHelperModel();
+          break;
+        case 'setupVoice':
+          voice.openSetupTerminal();
+          break;
+        case 'removeVoice':
+          await this._removeVoice();
+          break;
+        case 'toggleSkills': {
+          const config = vscode.workspace.getConfiguration('localAI');
+          await config.update('useClaudeSkills', config.get('useClaudeSkills') === false, vscode.ConfigurationTarget.Global);
+          break;
+        }
+        case 'toggleAutoSkills': {
+          const config = vscode.workspace.getConfiguration('localAI');
+          await config.update('autoSkills', config.get('autoSkills') === false, vscode.ConfigurationTarget.Global);
+          break;
+        }
+        case 'rescanSkills':
+          skillsLib.invalidate();
+          await this._refreshState();
+          vscode.window.showInformationMessage('Skills rescanned.');
+          break;
+        case 'addSkillFolder':
+          await this._addSkillFolder();
+          break;
+        case 'openSkill': {
+          const known = this._skillSources().skills.find((sk) => sk.file === msg.path);
+          if (known) {
+            const doc = await vscode.workspace.openTextDocument(known.file);
+            await vscode.window.showTextDocument(doc);
+          }
+          break;
+        }
+        case 'revealFolder': {
+          const known = this._skillSources().folders.find((f) => f.path === msg.path && f.exists);
+          if (known) await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(known.path));
+          break;
+        }
         case 'toggleIncludeActiveFile': {
           const current = this._context.globalState.get('localAI.includeActiveFile', false);
           await this._context.globalState.update('localAI.includeActiveFile', !current);
@@ -65,7 +149,349 @@ class SidebarProvider {
       }
     });
 
+    const configWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('localAI')) this._refreshState();
+    });
+    const folderWatcher = vscode.workspace.onDidChangeWorkspaceFolders(() => this._refreshState());
+    const modelWatcher = modelState.onDidChange(() => this._refreshState());
+    webviewView.onDidDispose(() => {
+      configWatcher.dispose();
+      folderWatcher.dispose();
+      modelWatcher.dispose();
+    });
+
     this._refreshState();
+  }
+
+  _skillSources() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    return skillsLib.describeSources({
+      workspaceRoot: resolveWorkspaceRoot(),
+      extraFolders: config.get('extraSkillFolders') || []
+    });
+  }
+
+  async _removeVoice() {
+    const info = voice.info();
+    const uninstall = info.canUninstallWhisper ? voice.uninstallCommand() : null;
+    const actions = [];
+    if (info.modelIsOurs) actions.push('Delete speech model');
+    if (uninstall) actions.push('Delete model and uninstall whisper.cpp');
+    if (actions.length === 0) {
+      vscode.window.showInformationMessage(
+        'Nothing to delete here: the speech model and whisper.cpp were not installed by this extension. Remove them where you installed them.'
+      );
+      return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      `Remove offline voice input? This frees about ${info.modelMB} MB and the microphone button will stop working until you set it up again. Your recorder (ffmpeg/sox) is left alone.`,
+      { modal: true },
+      ...actions
+    );
+    if (!choice) return;
+
+    try {
+      if (info.modelIsOurs) voice.removeModel();
+      if (choice.includes('uninstall') && uninstall) {
+        voice.runInTerminal('Remove whisper.cpp', uninstall);
+      }
+      vscode.window.showInformationMessage('Voice input removed. You can set it up again any time from Settings.');
+    } catch (err) {
+      vscode.window.showErrorMessage(`Could not remove voice input: ${err.message}`);
+    }
+    await this._refreshState();
+  }
+
+  _pretty(p) {
+    const home = require('os').homedir();
+    return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+  }
+
+  _folderState() {
+    const path = require('path');
+    const fs = require('fs');
+    const config = vscode.workspace.getConfiguration('localAI');
+    const rules = workspaceLib.readRules();
+    const workspace = workspaceLib.workspaceFolderPaths();
+    const primary = workspaceLib.resolveWorkingRoot();
+    const items = [];
+    workspace.forEach((p) => {
+      const rule = rules.find((r) => r.path === p);
+      items.push({ path: p, display: this._pretty(p), name: path.basename(p), kind: 'project', level: rule ? rule.level : 'full', primary: p === primary, removable: false, exists: true });
+    });
+    rules.filter((r) => !workspace.includes(r.path)).forEach((r) => {
+      let exists = false;
+      try {
+        exists = fs.statSync(r.path).isDirectory();
+      } catch (_) {
+        exists = false;
+      }
+      items.push({
+        path: r.path,
+        display: this._pretty(r.path),
+        name: path.basename(r.path) || r.path,
+        kind: workspace.some((w) => workspaceLib.isInside(r.path, w)) ? 'inside' : 'extra',
+        level: r.level,
+        primary: r.path === primary,
+        removable: true,
+        exists
+      });
+    });
+    if (primary && !items.some((i) => i.path === primary)) {
+      items.unshift({ path: primary, display: this._pretty(primary), name: path.basename(primary), kind: 'auto', level: 'full', primary: true, removable: false, exists: true });
+    }
+    return { items, primary, hasOverride: !!config.get('workingFolder'), noWorkspace: workspace.length === 0 };
+  }
+
+  async _updateRules(mutate) {
+    const config = vscode.workspace.getConfiguration('localAI');
+    const raw = (config.get('folderAccess') || []).filter((r) => r && typeof r.path === 'string');
+    await config.update('folderAccess', mutate(raw), vscode.ConfigurationTarget.Global);
+  }
+
+  async _setFolderLevel(folderPath, level) {
+    if (!workspaceLib.LEVELS.includes(level) || !folderPath) return;
+    const workspace = workspaceLib.workspaceFolderPaths();
+    await this._updateRules((raw) => {
+      const rest = raw.filter((r) => workspaceLib.normalize(workspaceLib.expandHome(r.path)) !== folderPath);
+      if (level === 'full' && workspace.includes(folderPath)) return rest;
+      return [...rest, { path: folderPath, level }];
+    });
+  }
+
+  async _chooseVariant(modelName) {
+    if (!modelName) return;
+    let variants;
+    try {
+      variants = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `Loading variants of ${modelName} from ollama.com...` },
+        () => modelTags.fetchVariants(modelName)
+      );
+    } catch (err) {
+      const choice = await vscode.window.showErrorMessage(
+        `Could not load the variant list: ${err.message}`,
+        'Enter a tag manually'
+      );
+      if (choice === 'Enter a tag manually') {
+        const [family, size] = modelName.split(':');
+        const typed = await vscode.window.showInputBox({
+          prompt: `Exact tag to download, for example ${family}:${(size || '7b').split('-')[0]}-instruct-q8_0 (see ollama.com/library/${family}/tags)`,
+          value: modelName,
+          validateInput: (v) => (/^[\w.\-]+(?::[\w.\-]+)?$/.test(v) ? null : 'Use the form name:tag')
+        });
+        if (typed) await this._installModel(typed.trim());
+      }
+      return;
+    }
+    if (!variants || variants.length === 0) {
+      vscode.window.showInformationMessage(`${modelName} has no other quantization variants. You can still install it as it is.`);
+      return;
+    }
+
+    const localModels = await this._ollamaClient.listLocalModels().catch(() => []);
+    const installed = new Set(localModels.map((m) => m.name));
+    const byDigest = new Map(localModels.filter((m) => m.digest).map((m) => [m.digest.slice(0, 12), m.name]));
+    const installedAs = (v) => (v.digest && byDigest.get(v.digest)) || (installed.has(v.name) ? v.name : null);
+
+    const ctx = generationLib.summary().contextSize;
+    const hw = hardware.info();
+    const best = hardware.bestVariant(variants, ctx);
+    const rows = variants.map((v) => ({ v, a: hardware.assess(v.sizeGB, v.name, ctx) }));
+    const iconFor = { great: '$(pass-filled)', ok: '$(pass)', tight: '$(warning)', slow: '$(clock)', heavy: '$(error)', unknown: '$(circle-outline)' };
+
+    const makeItem = ({ v, a }) => ({
+      label: `${best && v.name === best.name ? '$(star-full) ' : `${iconFor[a.level]} `}${installedAs(v) ? '$(check) ' : ''}${v.quant}`,
+      description: `${v.sizeGB ? `${v.sizeGB.toFixed(1)} GB` : 'size unknown'}${v.context ? ` \u00b7 ${v.context} context` : ''}${installedAs(v) ? ` \u00b7 installed as ${installedAs(v)}` : ''}`,
+      detail: `${best && v.name === best.name ? 'Recommended for your computer. ' : ''}${hardware.LEVEL_TEXT[a.level] ? `${hardware.LEVEL_TEXT[a.level][0].toUpperCase()}${hardware.LEVEL_TEXT[a.level].slice(1)}` : ''}${a.needGB ? ` (needs about ${a.needGB.toFixed(1)} GB of ${a.budgetGB.toFixed(1)} GB)` : ''}. ${v.note}  [${v.name}]`,
+      variant: v
+    });
+
+    const Separator = vscode.QuickPickItemKind.Separator;
+    const items = [];
+    const push = (label, filter) => {
+      const group = rows.filter(filter).sort((x, y) => y.v.sizeGB - x.v.sizeGB);
+      if (group.length === 0) return;
+      items.push({ label, kind: Separator });
+      group.forEach((r) => items.push(makeItem(r)));
+    };
+    push('Recommended for your computer', (r) => best && r.v.name === best.name);
+    push('Fits your computer', (r) => ['great', 'ok'].includes(r.a.level) && !(best && r.v.name === best.name));
+    push('Tight or slow', (r) => ['tight', 'slow'].includes(r.a.level));
+    push('Too heavy for this computer', (r) => r.a.level === 'heavy');
+    push('Size unknown', (r) => r.a.level === 'unknown');
+
+    const picked = await vscode.window.showQuickPick(items, {
+      title: `Quantization for ${modelName}  -  your computer: ${hw.label}`,
+      placeHolder: best
+        ? 'The star is the best quality that still fits well. Lower number = smaller and faster, higher = better quality.'
+        : 'None of these fit well on this computer. A smaller model (e.g. 7B) with a higher quantization is a better choice.',
+      matchOnDetail: true
+    });
+    if (!picked || !picked.variant) return;
+    const already = installedAs(picked.variant);
+    if (already) {
+      await modelState.setSelectedModel(this._context, already);
+      vscode.window.showInformationMessage(`Already installed as ${already}. It is now the active model.`);
+      return;
+    }
+    await this._installModel(picked.variant.name, picked.variant.sizeGB || undefined);
+  }
+
+  _hardwareState() {
+    const hw = hardware.info();
+    const ctx = generationLib.summary().contextSize;
+    const fits = {};
+    RECOMMENDED_MODELS.forEach((m) => {
+      fits[m.name] = { level: hardware.assess(m.sizeGB, m.name, ctx).level, best: false };
+    });
+    ['code', 'general', 'vision'].forEach((category) => {
+      const candidates = RECOMMENDED_MODELS.filter((m) => m.category === category && ['great', 'ok'].includes(fits[m.name].level))
+        .sort((a, b) => b.sizeGB - a.sizeGB);
+      const withTools = candidates.filter((m) => (m.tags || []).includes('tools'));
+      const pick = (category === 'vision' ? candidates : withTools.length ? withTools : candidates)[0];
+      if (pick) fits[pick.name].best = true;
+    });
+    return { label: hw.label, comfortGB: Math.round(hardware.comfortableModelGB(ctx) * 10) / 10, fits };
+  }
+
+  async _chooseResponseMode() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    const current = generationLib.currentMode();
+    const items = [
+      ...Object.entries(generationLib.PRESETS).map(([id, p]) => ({
+        label: `${id === current ? '$(check) ' : ''}${p.label}`,
+        description: `temperature ${p.temperature}`,
+        detail: p.description,
+        mode: id
+      })),
+      { label: `${current === 'custom' ? '$(check) ' : ''}Custom...`, description: 'set temperature, top-p, top-k and repeat penalty yourself', mode: 'custom' }
+    ];
+    const picked = await vscode.window.showQuickPick(items, { title: 'How should the model answer?' });
+    if (!picked) return;
+    if (picked.mode === 'custom') {
+      const ask = async (prompt, key, fallback, min, max) => {
+        const value = await vscode.window.showInputBox({
+          prompt,
+          value: String(config.get(key) ?? fallback),
+          validateInput: (v) => (Number.isFinite(Number(v)) && Number(v) >= min && Number(v) <= max ? null : `Enter a number from ${min} to ${max}`)
+        });
+        if (value === undefined) return false;
+        await config.update(key, Number(value), vscode.ConfigurationTarget.Global);
+        return true;
+      };
+      if (!(await ask('Temperature (0 = exact, 1 = varied)', 'temperature', 0.2, 0, 2))) return;
+      if (!(await ask('Top-p (0.1 - 1)', 'topP', 0.9, 0.05, 1))) return;
+      if (!(await ask('Top-k (0 = off)', 'topK', 40, 0, 1000))) return;
+      if (!(await ask('Repeat penalty (1 = off)', 'repeatPenalty', 1.05, 0.5, 2))) return;
+    }
+    await config.update('responseMode', picked.mode, vscode.ConfigurationTarget.Global);
+  }
+
+  async _chooseContext() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    const current = Number(config.get('contextSize')) || 16384;
+    const sizes = [4096, 8192, 16384, 32768, 65536, 131072];
+    const notes = { 4096: 'fastest, remembers little', 8192: 'short chats', 16384: 'default, good for projects', 32768: 'long files and chats, more RAM', 65536: 'very long, needs a lot of RAM', 131072: 'maximum, only for big machines' };
+    const picked = await vscode.window.showQuickPick(
+      sizes.map((n) => ({ label: `${n === current ? '$(check) ' : ''}${Math.round(n / 1024)}K tokens`, description: notes[n], value: n })),
+      { title: 'Context length (how much the model remembers)', placeHolder: 'Larger values use more RAM and are slower. Models have their own maximum.' }
+    );
+    if (picked) await config.update('contextSize', picked.value, vscode.ConfigurationTarget.Global);
+  }
+
+  async _chooseHelperModel() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    const current = String(config.get('subagentModel') || '').trim();
+    const models = await this._ollamaClient.listLocalModels().catch(() => []);
+    const items = [
+      { label: `${current === '' ? '$(check) ' : ''}Same model as the chat`, description: 'default', detail: 'Helpers use the model you chat with.', value: '' },
+      { label: `${current === 'auto' ? '$(check) ' : ''}Auto: the smallest installed model`, description: 'fast helpers', detail: 'Research helpers use your smallest installed model that is smaller than the chat model. Helpers that edit files always use the chat model.', value: 'auto' },
+      { label: 'Installed models', kind: vscode.QuickPickItemKind.Separator },
+      ...models
+        .slice()
+        .sort((a, b) => a.size - b.size)
+        .map((m) => {
+          const entry = require('./models.json').find((c) => c.name === m.name);
+          const tools = entry ? (entry.tags || []).includes('tools') : true;
+          return {
+            label: `${current === m.name ? '$(check) ' : ''}${m.name}`,
+            description: `${(m.size / 1e9).toFixed(1)} GB`,
+            detail: tools
+              ? 'Can use tools: reads and searches files itself.'
+              : 'No tools: reads the files directly (fast, good for simple reading tasks).',
+            value: m.name
+          };
+        })
+    ];
+    const picked = await vscode.window.showQuickPick(items, {
+      title: 'Which model should research helpers use?',
+      placeHolder: 'A small fast model is enough for simple reading and summarising. Helpers that edit files always use the chat model.'
+    });
+    if (!picked || picked.value === undefined) return;
+    await config.update('subagentModel', picked.value, vscode.ConfigurationTarget.Global);
+  }
+
+  async _chooseGpu() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    const picked = await vscode.window.showQuickPick(
+      [
+        { label: 'Automatic', description: 'Ollama decides (recommended)', value: -1 },
+        { label: 'CPU only', description: 'Slowest, but frees the GPU and video memory', value: 0 },
+        { label: 'Custom number of GPU layers...', description: 'for fine tuning when the model does not fit in video memory', value: 'custom' }
+      ],
+      { title: 'Where should the model run?' }
+    );
+    if (!picked) return;
+    let value = picked.value;
+    if (value === 'custom') {
+      const typed = await vscode.window.showInputBox({
+        prompt: 'Number of layers to put on the GPU (lower = less video memory)',
+        validateInput: (v) => (/^\d+$/.test(v) ? null : 'Enter a whole number, 0 or more')
+      });
+      if (typed === undefined) return;
+      value = Number(typed);
+    }
+    await config.update('gpuLayers', value, vscode.ConfigurationTarget.Global);
+  }
+
+  async _addAccessFolder() {
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFolders: true,
+      canSelectFiles: false,
+      canSelectMany: false,
+      openLabel: 'Choose folder',
+      title: 'Choose a folder to give or restrict access to'
+    });
+    if (!picked || picked.length === 0) return;
+    const folderPath = workspaceLib.normalize(picked[0].fsPath);
+    const level = await vscode.window.showQuickPick(
+      [
+        { label: 'Read only', description: 'The AI can look at the files but not change them', level: 'read' },
+        { label: 'Ask first', description: 'Reads freely; every edit or command needs your approval, even in auto modes', level: 'ask' },
+        { label: 'Full access', description: 'Follows the permission mode (ask / auto / autopilot)', level: 'full' },
+        { label: 'No access', description: 'Hide this folder from the AI completely', level: 'none' }
+      ],
+      { title: `Access level for ${this._pretty(folderPath)}` }
+    );
+    if (!level) return;
+    await this._setFolderLevel(folderPath, level.level);
+  }
+
+  async _addSkillFolder() {
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFolders: true,
+      canSelectFiles: false,
+      canSelectMany: false,
+      openLabel: 'Use as skills folder',
+      title: 'Choose a folder that contains skills (subfolders with SKILL.md)'
+    });
+    if (!picked || picked.length === 0) return;
+    const config = vscode.workspace.getConfiguration('localAI');
+    const current = config.get('extraSkillFolders') || [];
+    const next = picked[0].fsPath;
+    if (!current.includes(next)) {
+      await config.update('extraSkillFolders', [...current, next], vscode.ConfigurationTarget.Global);
+    }
   }
 
   async _uninstallOllama() {
@@ -127,30 +553,44 @@ class SidebarProvider {
       'Uninstall started in the terminal. Some steps may ask for your password. Click "Check again" once it finishes.'
     );
 
-    await this._context.globalState.update('localAI.selectedModel', undefined);
+    await modelState.setSelectedModel(this._context, undefined);
+  }
+
+  async _waitUntilReady(timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await this._ollamaClient.ping()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 600));
+    }
+    return false;
   }
 
   async _startOllamaServer() {
-    const result = ollamaProcess.startServer();
-
-    if (!result.started && result.reason === 'already-running') {
-      vscode.window.showInformationMessage('Ollama server is already running.');
+    if (await this._ollamaClient.ping()) {
       await this._refreshState();
       return;
     }
 
-    if (!result.started) {
+    const result = ollamaProcess.startServer();
+
+    if (!result.started && result.reason === 'not-installed') {
       vscode.window.showErrorMessage(
-        `Could not start Ollama: ${result.reason}. Make sure Ollama is installed and the "ollama" command is on your PATH.`
+        'Ollama is not installed (the "ollama" program was not found). Use "Install automatically" or download it from ollama.com.'
       );
+      await this._refreshState();
       return;
     }
 
-    vscode.window.showInformationMessage(
-      'Starting Ollama server... it will stop automatically when you close VS Code.'
-    );
+    if (!result.started && result.reason !== 'already-running') {
+      vscode.window.showErrorMessage(`Could not start Ollama: ${result.reason}`);
+      await this._refreshState();
+      return;
+    }
 
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const ready = await this._waitUntilReady(12000);
+    if (!ready) {
+      vscode.window.showErrorMessage('Ollama was started but is not answering yet. Click "Check again" in a few seconds.');
+    }
     await this._refreshState();
   }
 
@@ -204,7 +644,7 @@ class SidebarProvider {
 
       const currentSelected = this._context.globalState.get('localAI.selectedModel');
       if (currentSelected === modelName) {
-        await this._context.globalState.update('localAI.selectedModel', undefined);
+        await modelState.setSelectedModel(this._context, undefined);
       }
 
       vscode.window.showInformationMessage(`Model ${modelName} deleted.`);
@@ -259,7 +699,11 @@ class SidebarProvider {
 
     const isRunning = await this._ollamaClient.ping();
     if (!isRunning) {
-      this._view.webview.postMessage({ type: 'ollamaNotRunning' });
+      this._view.webview.postMessage({
+        type: 'ollamaNotRunning',
+        installed: !!ollamaProcess.findBinary(),
+        binary: ollamaProcess.findBinary()
+      });
       return;
     }
 
@@ -270,7 +714,12 @@ class SidebarProvider {
       localModels = [];
     }
 
-    const localNames = localModels.map((m) => m.name);
+    const installed = localModels.map((m) => ({
+      name: m.name,
+      quant: (m.details && m.details.quantization_level) || '',
+      params: (m.details && m.details.parameter_size) || '',
+      sizeGB: m.size ? m.size / (1024 * 1024 * 1024) : 0
+    }));
     const selectedModel = this._context.globalState.get('localAI.selectedModel') || null;
     const systemPrompt = this._context.globalState.get('localAI.systemPrompt') || '';
     const keepAlive = this._context.globalState.get('localAI.keepAlive') || '';
@@ -278,25 +727,37 @@ class SidebarProvider {
 
     this._view.webview.postMessage({
       type: 'ollamaReady',
-      installedModels: localNames,
+      installedModels: installed,
       recommendedModels: RECOMMENDED_MODELS,
+      totalRamGB: require('os').totalmem() / (1024 * 1024 * 1024),
       selectedModel,
       systemPrompt,
       keepAlive,
-      includeActiveFile
+      includeActiveFile,
+      voice: voice.info(),
+      generation: generationLib.summary(),
+      hardware: this._hardwareState(),
+      folders: this._folderState(),
+      skills: {
+        enabled: vscode.workspace.getConfiguration('localAI').get('useClaudeSkills') !== false,
+        auto: vscode.workspace.getConfiguration('localAI').get('autoSkills') !== false,
+        cache: skillsLib.cacheInfo(),
+        ...this._skillSources()
+      }
     });
   }
 
-  async _installModel(modelName) {
+  async _installModel(modelName, sizeOverrideGB) {
     if (!this._view || this._pullInProgress.has(modelName)) return;
 
     const catalogEntry = RECOMMENDED_MODELS.find((m) => m.name === modelName);
-    if (catalogEntry && typeof catalogEntry.sizeGB === 'number') {
+    const knownSize = typeof sizeOverrideGB === 'number' ? sizeOverrideGB : catalogEntry && catalogEntry.sizeGB;
+    if (typeof knownSize === 'number') {
       const os = require('os');
       const totalRamGB = os.totalmem() / (1024 * 1024 * 1024);
-      if (catalogEntry.sizeGB > totalRamGB * 0.7) {
+      if (knownSize > totalRamGB * 0.7) {
         const choice = await vscode.window.showWarningMessage(
-          `This model needs about ${catalogEntry.sizeGB} GB, but your machine has ~${totalRamGB.toFixed(0)} GB of RAM total. It may run very slowly, swap heavily, or fail to load. Continue anyway?`,
+          `This model needs about ${knownSize} GB, but your machine has ~${totalRamGB.toFixed(0)} GB of RAM total. It may run very slowly, swap heavily, or fail to load. Continue anyway?`,
           { modal: true },
           'Install anyway'
         );
@@ -331,9 +792,10 @@ class SidebarProvider {
             status: evt.status
           });
         }
-      });
+      }, { onAbortReady: (abort) => this._pullAborts.set(modelName, abort) });
+      this._pullAborts.delete(modelName);
 
-      await this._context.globalState.update('localAI.selectedModel', modelName);
+      await modelState.setSelectedModel(this._context, modelName);
       this._pullInProgress.delete(modelName);
       this._view.webview.postMessage({ type: 'pullDone', modelName });
       await this._refreshState();
@@ -342,6 +804,12 @@ class SidebarProvider {
       );
     } catch (err) {
       this._pullInProgress.delete(modelName);
+      this._pullAborts.delete(modelName);
+      if (err.cancelled) {
+        this._view.webview.postMessage({ type: 'pullCancelled', modelName });
+        vscode.window.showInformationMessage(`Download of ${modelName} cancelled. What was already downloaded is kept, so installing it again resumes.`);
+        return;
+      }
       this._view.webview.postMessage({
         type: 'pullError',
         modelName,
@@ -352,469 +820,20 @@ class SidebarProvider {
   }
 
   _getHtml() {
+    const media = (...parts) =>
+      this._view.webview.asWebviewUri(vscode.Uri.joinPath(this._context.extensionUri, 'media', ...parts));
+    const iconMap = JSON.stringify(ICONS).replace(/</g, '\\u003c');
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<style>
-  * { box-sizing: border-box; }
-  body {
-    font-family: var(--vscode-font-family);
-    color: var(--vscode-editor-foreground);
-    padding: 12px;
-    margin: 0;
-  }
-  h3 {
-    margin: 0 0 8px 0;
-    font-size: 11px;
-    text-transform: uppercase;
-    opacity: 0.65;
-    letter-spacing: 0.5px;
-  }
-  .box {
-    padding: 12px;
-    border-radius: 6px;
-    background: var(--vscode-textBlockQuote-background);
-    margin-bottom: 14px;
-    font-size: 13px;
-    line-height: 1.5;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .box.warn { border-left: 3px solid #d9822b; }
-  .box.ok { border-left: 3px solid #4caf50; }
-  .box .icon-svg { flex-shrink: 0; }
-
-  button {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    text-align: left;
-    background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
-    color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
-    border: none;
-    padding: 9px 12px;
-    margin-bottom: 8px;
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 13px;
-  }
-  .icon-svg { flex-shrink: 0; display: block; }
-  button:hover { background: var(--vscode-button-hoverBackground); }
-  button:disabled { opacity: 0.5; cursor: default; }
-  button.primary {
-    background: var(--vscode-button-background);
-    color: var(--vscode-button-foreground);
-    font-weight: 600;
-  }
-  button.primary:hover { background: var(--vscode-button-hoverBackground); }
-
-  .model-card {
-    border: 1px solid var(--vscode-widget-border);
-    border-radius: 6px;
-    padding: 10px;
-    margin-bottom: 10px;
-  }
-  .model-card .name {
-    font-weight: 600;
-    font-size: 13px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  .model-card .desc {
-    font-size: 11px;
-    opacity: 0.7;
-    margin: 3px 0 8px 0;
-  }
-  .badge {
-    font-size: 10px;
-    padding: 2px 6px;
-    border-radius: 10px;
-    background: #4caf50;
-    color: white;
-  }
-  .badge.active {
-    background: var(--vscode-button-background);
-  }
-
-  .quick-switch {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-bottom: 14px;
-  }
-  .quick-switch .chip {
-    padding: 4px 10px;
-    border-radius: 12px;
-    background: var(--vscode-editorWidget-background);
-    border: 1px solid var(--vscode-widget-border);
-    font-size: 11px;
-    cursor: pointer;
-  }
-  .quick-switch .chip:hover {
-    background: rgba(127,127,127,0.2);
-  }
-  .quick-switch .chip.active {
-    background: var(--vscode-button-background);
-    color: var(--vscode-button-foreground);
-    border-color: var(--vscode-button-background);
-    cursor: default;
-  }
-
-  .model-card .name-actions {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .icon-btn {
-    display: inline-flex;
-    width: auto;
-    background: transparent !important;
-    border: none;
-    padding: 2px 5px !important;
-    margin: 0 !important;
-    cursor: pointer;
-    opacity: 0.6;
-  }
-  .icon-btn:hover {
-    opacity: 1;
-    background: rgba(244,71,71,0.15) !important;
-    border-radius: 4px;
-  }
-  .progress-track {
-    height: 6px;
-    border-radius: 3px;
-    background: var(--vscode-editorWidget-background);
-    overflow: hidden;
-    margin-top: 6px;
-  }
-  .progress-fill {
-    height: 100%;
-    background: var(--vscode-button-background);
-    width: 0%;
-    transition: width 0.2s ease;
-  }
-  .progress-label {
-    font-size: 10px;
-    opacity: 0.7;
-    margin-top: 4px;
-  }
-  #loading { font-size: 12px; opacity: 0.7; }
-  .divider { height: 1px; background: var(--vscode-widget-border); margin: 14px 0; }
-
-  .category-header {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    cursor: pointer;
-    padding: 6px 4px;
-    margin-top: 10px;
-    border-radius: 4px;
-    user-select: none;
-  }
-  .category-header:hover {
-    background: rgba(127,127,127,0.15);
-  }
-  .category-header .chevron {
-    display: flex;
-    align-items: center;
-    opacity: 0.7;
-  }
-  .category-header .category-title {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    opacity: 0.9;
-    font-weight: 600;
-  }
-  .category-header .category-count {
-    font-size: 10px;
-    opacity: 0.55;
-    margin-left: auto;
-  }
-
-  .family-heading {
-    font-size: 10.5px;
-    opacity: 0.6;
-    margin: 10px 0 4px 4px;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-  }
-  .danger-zone {
-    margin-top: 16px;
-    padding-top: 12px;
-    border-top: 1px solid var(--vscode-widget-border);
-  }
-  .danger-link {
-    background: transparent !important;
-    color: var(--vscode-errorForeground) !important;
-    opacity: 0.6;
-    font-size: 12px;
-  }
-  .danger-link:hover {
-    opacity: 1;
-    background: rgba(244,71,71,0.1) !important;
-  }
-</style>
+<link rel="stylesheet" href="${media('sidebar', 'sidebar.css')}" />
 </head>
 <body>
-  <div id="content"><div id="loading">Checking Ollama...</div></div>
-
-<script>
-  const vscode = acquireVsCodeApi();
-  const content = document.getElementById('content');
-  let state = { view: 'loading' };
-  const pulls = {};
-  const collapsedCategories = {};
-
-  function send(type, extra) {
-    vscode.postMessage(Object.assign({ type }, extra || {}));
-  }
-
-  function render() {
-    if (state.view === 'loading') {
-      content.innerHTML = '<div id="loading">Checking Ollama...</div>';
-      return;
-    }
-
-    if (state.view === 'notRunning') {
-      content.innerHTML =
-        '<div class="box warn">${ICONS.warning} Ollama was not found or is not running on localhost.</div>' +
-        '<h3>Already installed?</h3>' +
-        '<button class="primary" id="btnStartServer">${ICONS.play} Start Ollama server</button>' +
-        '<h3 style="margin-top:14px;">Not installed yet?</h3>' +
-        '<button id="btnAutoInstall">${ICONS.bolt} Install automatically</button>' +
-        '<button id="btnDownload">${ICONS.download} Download manually (website)</button>' +
-        '<button id="btnRecheck">${ICONS.refresh} I installed it, check again</button>' +
-        '<div class="danger-zone"><button id="btnUninstall" class="danger-link">${ICONS.trash} Uninstall Ollama completely</button></div>';
-      document.getElementById('btnStartServer').onclick = () => {
-        state.view = 'loading';
-        render();
-        send('startOllamaServer');
-      };
-      document.getElementById('btnAutoInstall').onclick = () => send('autoInstallOllama');
-      document.getElementById('btnDownload').onclick = () => send('openOllamaSite');
-      document.getElementById('btnRecheck').onclick = () => {
-        state.view = 'loading';
-        render();
-        send('recheckOllama');
-      };
-      document.getElementById('btnUninstall').onclick = () => send('uninstallOllama');
-      return;
-    }
-
-    if (state.view === 'ready') {
-      let html = '';
-
-      if (state.selectedModel) {
-        html += '<div class="box ok">${ICONS.check} Active model: <b>' + state.selectedModel + '</b></div>';
-        html += '<button class="primary" id="btnChat">${ICONS.chat} Open chat</button>';
-        html += '<button id="btnSystemPrompt">${ICONS.pencil} ' +
-          (state.systemPrompt ? 'Edit system prompt' : 'Set system prompt / persona') + '</button>';
-        if (state.systemPrompt) {
-          html += '<div class="box" style="font-size:11px;opacity:0.8;">"' +
-            (state.systemPrompt.length > 100 ? state.systemPrompt.slice(0, 100) + '...' : state.systemPrompt) +
-            '"</div>';
-        }
-        html += '<button id="btnKeepAlive">${ICONS.play} Keep model in RAM: ' +
-          (state.keepAlive || '5m (default)') + '</button>';
-        html += '<button id="btnIncludeActiveFile">' +
-          (state.includeActiveFile ? '${ICONS.check}' : '${ICONS.close}') +
-          ' Auto-include active file as context: ' + (state.includeActiveFile ? 'On' : 'Off') + '</button>';
-
-        if (state.installedModels.length > 0) {
-          html += '<h3>Quick switch</h3>';
-          html += '<div class="quick-switch">';
-          state.installedModels.forEach((name) => {
-            const isActive = name === state.selectedModel;
-            html += '<span class="chip' + (isActive ? ' active' : '') + '" data-quick-model="' + name + '">' + name + '</span>';
-          });
-          html += '</div>';
-        }
-
-        html += '<div class="divider"></div>';
-      } else {
-        html += '<div class="box warn">${ICONS.warning} No model selected yet. Pick one below.</div>';
-      }
-
-      html += '<h3>Models</h3>';
-
-      const allModels = state.recommendedModels.map((m) => ({
-        name: m.name,
-        label: m.label,
-        description: m.description,
-        category: m.category || 'general',
-        family: m.family || m.name,
-        sizeGB: typeof m.sizeGB === 'number' ? m.sizeGB : 0
-      }));
-
-      state.installedModels.forEach((name) => {
-        if (!allModels.find((m) => m.name === name)) {
-          allModels.unshift({ name, label: name, description: 'installed manually', category: 'other', family: name, sizeGB: 0 });
-        }
-      });
-
-      const categoryLabels = { code: 'Code', general: 'General', vision: 'Vision', other: 'Other' };
-      const categoryOrder = ['code', 'general', 'vision', 'other'];
-      const grouped = {};
-      allModels.forEach((m) => {
-        if (!grouped[m.category]) grouped[m.category] = [];
-        grouped[m.category].push(m);
-      });
-
-      categoryOrder.forEach((cat) => {
-        if (!grouped[cat] || grouped[cat].length === 0) return;
-        const isCollapsed = collapsedCategories[cat] !== false;
-
-        html += '<div class="category-header" data-category="' + cat + '">' +
-          '<span class="chevron">' + (isCollapsed ? '${ICONS.chevronRight}' : '${ICONS.chevronDown}') + '</span>' +
-          '<span class="category-title">' + (categoryLabels[cat] || cat) + '</span>' +
-          '<span class="category-count">' + grouped[cat].length + '</span>' +
-        '</div>';
-
-        if (isCollapsed) return;
-
-        const byFamily = {};
-        const familyOrder = [];
-        grouped[cat].forEach((m) => {
-          if (!byFamily[m.family]) {
-            byFamily[m.family] = [];
-            familyOrder.push(m.family);
-          }
-          byFamily[m.family].push(m);
-        });
-
-        const familyRank = familyOrder.map((fam, idx) => {
-          const models = byFamily[fam];
-          const hasActive = models.some((m) => m.name === state.selectedModel);
-          const hasInstalled = models.some((m) => state.installedModels.includes(m.name));
-          const priority = hasActive ? 0 : hasInstalled ? 1 : 2;
-          return { fam, priority, idx };
-        });
-        familyRank.sort((a, b) => a.priority - b.priority || a.idx - b.idx);
-
-        familyRank.forEach(({ fam }) => {
-          const modelsInFamily = byFamily[fam].slice().sort((a, b) => a.sizeGB - b.sizeGB);
-
-          html += '<div class="family-heading">' + fam + '</div>';
-
-          modelsInFamily.forEach((m) => {
-            const installed = state.installedModels.includes(m.name);
-            const isActive = state.selectedModel === m.name;
-            const pull = pulls[m.name];
-
-            html += '<div class="model-card" data-model="' + m.name + '">';
-            html += '<div class="name"><span>' + m.label + '</span>';
-            html += '<span class="name-actions">';
-            if (isActive) html += '<span class="badge active">active</span>';
-            else if (installed) html += '<span class="badge">downloaded</span>';
-            if (installed) {
-              html += '<button class="icon-btn" data-action="delete" data-model="' + m.name + '" title="Delete model">${ICONS.trash}</button>';
-            }
-            html += '</span>';
-            html += '</div>';
-            html += '<div class="desc">' + (m.description || '') + '</div>';
-
-            if (pull && !pull.done) {
-              html += '<div class="progress-track"><div class="progress-fill" style="width:' + (pull.percent || 0) + '%"></div></div>';
-              html += '<div class="progress-label">' + (pull.status || '') + ' ' + (pull.percent || 0) + '%</div>';
-            } else if (installed) {
-              html += '<button data-action="use" data-model="' + m.name + '"' + (isActive ? ' disabled' : '') + '>' +
-                      (isActive ? '${ICONS.check} Selected' : 'Use this model') + '</button>';
-            } else {
-              html += '<button data-action="install" data-model="' + m.name + '">Install</button>';
-            }
-
-            html += '</div>';
-          });
-        });
-      });
-
-      html += '<button id="btnManual">${ICONS.pencil} Enter a model name manually...</button>';
-      html += '<div class="danger-zone"><button id="btnUninstall" class="danger-link">${ICONS.trash} Uninstall Ollama completely</button></div>';
-
-      content.innerHTML = html;
-
-      content.querySelectorAll('.category-header').forEach((header) => {
-        header.onclick = () => {
-          const cat = header.getAttribute('data-category');
-          const currentlyCollapsed = collapsedCategories[cat] !== false;
-          collapsedCategories[cat] = !currentlyCollapsed;
-          render();
-        };
-      });
-
-      const chatBtn = document.getElementById('btnChat');
-      if (chatBtn) chatBtn.onclick = () => send('openChat');
-      const sysPromptBtn = document.getElementById('btnSystemPrompt');
-      if (sysPromptBtn) sysPromptBtn.onclick = () => send('editSystemPrompt');
-      const keepAliveBtn = document.getElementById('btnKeepAlive');
-      if (keepAliveBtn) keepAliveBtn.onclick = () => send('editKeepAlive');
-      const includeFileBtn = document.getElementById('btnIncludeActiveFile');
-      if (includeFileBtn) includeFileBtn.onclick = () => send('toggleIncludeActiveFile');
-      document.getElementById('btnManual').onclick = () => send('manualModel');
-      document.getElementById('btnUninstall').onclick = () => send('uninstallOllama');
-
-      content.querySelectorAll('button[data-action="install"]').forEach((btn) => {
-        btn.onclick = () => send('installModel', { modelName: btn.getAttribute('data-model') });
-      });
-      content.querySelectorAll('button[data-action="use"]').forEach((btn) => {
-        btn.onclick = () => send('selectInstalledModel', { modelName: btn.getAttribute('data-model') });
-      });
-      content.querySelectorAll('button[data-action="delete"]').forEach((btn) => {
-        btn.onclick = (e) => {
-          e.stopPropagation();
-          send('deleteModel', { modelName: btn.getAttribute('data-model') });
-        };
-      });
-      content.querySelectorAll('.quick-switch .chip[data-quick-model]').forEach((chip) => {
-        if (chip.classList.contains('active')) return;
-        chip.onclick = () => send('selectInstalledModel', { modelName: chip.getAttribute('data-quick-model') });
-      });
-    }
-  }
-
-  window.addEventListener('message', (event) => {
-    const msg = event.data;
-    switch (msg.type) {
-      case 'ollamaNotRunning':
-        state = { view: 'notRunning' };
-        render();
-        break;
-      case 'ollamaReady':
-        state = {
-          view: 'ready',
-          installedModels: msg.installedModels,
-          recommendedModels: msg.recommendedModels,
-          selectedModel: msg.selectedModel,
-          systemPrompt: msg.systemPrompt || '',
-          keepAlive: msg.keepAlive || ''
-        };
-        render();
-        break;
-      case 'pullStart':
-        pulls[msg.modelName] = { percent: 0, status: 'Starting download...', done: false };
-        render();
-        break;
-      case 'pullProgress':
-        pulls[msg.modelName] = { percent: msg.percent, status: msg.status, done: false };
-        render();
-        break;
-      case 'pullDone':
-        pulls[msg.modelName] = { percent: 100, status: 'Done', done: true };
-        break;
-      case 'pullError':
-        delete pulls[msg.modelName];
-        render();
-        break;
-    }
-  });
-
-  send('ready');
-</script>
+  <div id="content"></div>
+<script>window.ICONS = ${iconMap};</script>
+<script src="${media('sidebar', 'sidebar.js')}"></script>
 </body>
 </html>`;
   }

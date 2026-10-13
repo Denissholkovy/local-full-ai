@@ -1,4 +1,5 @@
 const vscode = require('vscode');
+const modelState = require('./modelState');
 const MODEL_CATALOG = require('./models.json');
 
 const RECOMMENDED_MODELS = MODEL_CATALOG;
@@ -25,26 +26,52 @@ async function pickAndInstallModel(ollamaClient, context) {
 
   const localNames = new Set(localModels.map((m) => m.name));
 
-  const items = [
-    ...localModels.map((m) => ({
-      label: `$(check) ${m.name}`,
-      description: 'already installed locally',
-      modelName: m.name,
-      alreadyInstalled: true
-    })),
-    ...RECOMMENDED_MODELS.filter((m) => !localNames.has(m.name)).map((m) => ({
-      label: m.label,
-      description: m.description,
-      modelName: m.name,
-      alreadyInstalled: false
-    })),
-    {
-      label: '$(edit) Enter a model name manually...',
-      description: 'any model from ollama.com/library',
-      modelName: null,
-      alreadyInstalled: false
-    }
+  const Separator = vscode.QuickPickItemKind.Separator;
+  const selected = context.globalState.get('localAI.selectedModel');
+  const describe = (m) =>
+    [m.recommended ? '\u2605' : '', `${m.sizeGB} GB`, (m.tags || []).join(', '), m.description]
+      .filter(Boolean)
+      .join(' · ');
+
+  const items = [];
+  if (localModels.length > 0) {
+    items.push({ label: 'Installed', kind: Separator });
+    localModels.forEach((m) => {
+      items.push({
+        label: `$(check) ${m.name}`,
+        description: m.name === selected ? 'active' : 'ready to use',
+        modelName: m.name,
+        alreadyInstalled: true
+      });
+    });
+  }
+
+  const categories = [
+    ['code', 'Code'],
+    ['general', 'General'],
+    ['vision', 'Vision']
   ];
+  categories.forEach(([id, title]) => {
+    const available = RECOMMENDED_MODELS.filter((m) => m.category === id && !localNames.has(m.name));
+    if (available.length === 0) return;
+    items.push({ label: title, kind: Separator });
+    available.forEach((m) => {
+      items.push({
+        label: m.label,
+        description: describe(m),
+        modelName: m.name,
+        alreadyInstalled: false
+      });
+    });
+  });
+
+  items.push({ label: 'Other', kind: Separator });
+  items.push({
+    label: '$(edit) Enter a model name manually...',
+    description: 'any model from ollama.com/library',
+    modelName: null,
+    alreadyInstalled: false
+  });
 
   const picked = await vscode.window.showQuickPick(items, {
     title: 'Local Full AI: pick a model',
@@ -63,7 +90,7 @@ async function pickAndInstallModel(ollamaClient, context) {
   }
 
   if (picked.alreadyInstalled) {
-    await context.globalState.update('localAI.selectedModel', modelName);
+    await modelState.setSelectedModel(context, modelName);
     vscode.window.showInformationMessage(`Selected model: ${modelName}`);
     return;
   }
@@ -72,11 +99,15 @@ async function pickAndInstallModel(ollamaClient, context) {
     {
       location: vscode.ProgressLocation.Notification,
       title: `Downloading model ${modelName}`,
-      cancellable: false
+      cancellable: true
     },
-    async (progress) => {
+    async (progress, token) => {
       let lastPercent = 0;
       try {
+        let abort = null;
+        token.onCancellationRequested(() => {
+          if (abort) abort();
+        });
         await ollamaClient.pullModel(modelName, (evt) => {
           if (evt.total && evt.completed) {
             const percent = Math.round((evt.completed / evt.total) * 100);
@@ -91,12 +122,16 @@ async function pickAndInstallModel(ollamaClient, context) {
           } else if (evt.status) {
             progress.report({ message: evt.status });
           }
-        });
-        await context.globalState.update('localAI.selectedModel', modelName);
+        }, { onAbortReady: (fn) => { abort = fn; } });
+        await modelState.setSelectedModel(context, modelName);
         vscode.window.showInformationMessage(
           `Model ${modelName} downloaded and ready to use offline.`
         );
       } catch (err) {
+        if (err.cancelled) {
+          vscode.window.showInformationMessage(`Download of ${modelName} cancelled. Installing it again resumes where it stopped.`);
+          return;
+        }
         vscode.window.showErrorMessage(`Failed to download model: ${err.message}`);
       }
     }

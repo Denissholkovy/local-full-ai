@@ -1,4 +1,14 @@
 .vscode/**
+.vscode-test/**
+.git/**
 .gitignore
+.claude/**
+CLAUDE.md
 *.vsix
 **/*.map
+node_modules/**
+package-lock.json
+**/*.md.bak
+!README.md
+!CHANGELOG.md
+!LICENSE

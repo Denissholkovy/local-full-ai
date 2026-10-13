@@ -4,10 +4,15 @@ const { pickAndInstallModel } = require('./modelPicker');
 const { ChatPanel } = require('./chatPanel');
 const { SidebarProvider } = require('./sidebarProvider');
 const ollamaProcess = require('./ollamaProcess');
+const voice = require('./voice');
+const beforeContent = require('./beforeContent');
+
+let activeClient = null;
 
 function activate(context) {
   const config = vscode.workspace.getConfiguration('localAI');
   const ollamaClient = new OllamaClient(config.get('ollamaBaseUrl'));
+  activeClient = ollamaClient;
 
   context.subscriptions.push(
     vscode.commands.registerCommand('localAI.selectModel', () => {
@@ -36,6 +41,12 @@ function activate(context) {
     })
   );
 
+  try {
+    require('./skills').setPersistence(context.globalStorageUri.fsPath);
+  } catch (_) {
+  }
+  beforeContent.register(context);
+
   const sidebarProvider = new SidebarProvider(context, ollamaClient);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('localAI.sidebar', sidebarProvider)
@@ -44,8 +55,14 @@ function activate(context) {
   console.log('Local Full AI activated. Runs fully locally through Ollama.');
 }
 
-function deactivate() {
-  ollamaProcess.stopServer();
+async function deactivate() {
+  if (ChatPanel.currentPanel) ChatPanel.currentPanel.dispose();
+  voice.cancelAll();
+  const stoppedOwnServer = ollamaProcess.stopServer();
+  const unload = vscode.workspace.getConfiguration('localAI').get('unloadModelsOnClose') !== false;
+  if (!stoppedOwnServer && unload && activeClient) {
+    await Promise.race([activeClient.unloadAllModels(), new Promise((resolve) => setTimeout(resolve, 3000))]);
+  }
 }
 
 module.exports = { activate, deactivate };

@@ -8,6 +8,8 @@ const VISION_MODEL_HINTS = [
   'moondream',
   'qwen2-vl',
   'qwen2.5-vl',
+  'qwen2.5vl',
+  'qwen3-vl',
   'minicpm-v',
   'pixtral',
   'granite3.2-vision',
