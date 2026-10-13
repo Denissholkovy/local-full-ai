@@ -12,6 +12,8 @@
   const modeBtn = document.getElementById('modeBtn');
   const micBtn = document.getElementById('micBtn');
   const usageBtn = document.getElementById('usageBtn');
+  const limitsBtn = document.getElementById('limitsBtn');
+  let cloudLimits = null;
   const attachmentPreview = document.getElementById('attachmentPreview');
   const modelChip = document.getElementById('modelChip');
   const workspaceChip = document.getElementById('workspaceChip');
@@ -131,8 +133,14 @@
     return { visible: visible.trim(), thinking };
   }
 
+  // The streaming bubble is re-rendered on every token, which would restart a CSS animation at 0 degrees
+  // each time (the spinner looks frozen). A negative delay keeps the rotation in step with the clock.
+  function spinnerHtml() {
+    return '<span class="spinner" style="animation-delay:-' + (Date.now() % 800) + 'ms"></span>';
+  }
+
   function fileChip(label, busy) {
-    return '<div class="file-chip-line">' + (busy ? '<span class="spinner"></span>' : icon('fileText')) + '<span>' + escapeHtml(label) + '</span></div>';
+    return '<div class="file-chip-line">' + (busy ? spinnerHtml() : icon('fileText')) + '<span>' + escapeHtml(label) + '</span></div>';
   }
 
   let isStreaming = false;
@@ -707,10 +715,67 @@
     regenerateBtn = btn;
   }
 
+  // A live "the AI is working" line at the very end of the chat, so it is clear that it has not stopped
+  // even when it has already written something (between steps, while thinking, while a tool runs).
+  let activityEl = null;
+  let activityLabel = 'Thinking';
+  let activitySince = 0;
+  let activityTimer = null;
+  let activityMoving = false;
+
+  function activityText() {
+    const seconds = Math.max(0, Math.floor((Date.now() - activitySince) / 1000));
+    return activityLabel + (seconds >= 3 ? ' \u00b7 ' + seconds + 's' : '');
+  }
+
+  function setActivity(label) {
+    activityLabel = label;
+    if (activityEl) activityEl.querySelector('.activity-text').textContent = activityText();
+  }
+
+  function syncActivity() {
+    const dock = document.getElementById('dialogDock');
+    const waitingForUser = !!(dock && dock.children.length > 0);
+    const dotsOnly = !!(currentBubble && currentBubble.querySelector('.typing-dot, .thinking-label') && !currentRaw);
+    if (!isGenerating || waitingForUser || dotsOnly) {
+      if (activityEl && activityEl.parentNode) activityEl.remove();
+      return;
+    }
+    if (!activityEl) {
+      activityEl = document.createElement('div');
+      activityEl.className = 'activity';
+      activityEl.innerHTML = '<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span><span class="activity-text"></span>';
+    }
+    activityEl.querySelector('.activity-text').textContent = activityText();
+    if (activityEl.parentNode !== messagesEl || activityEl.nextSibling) {
+      const stick = isNearBottom();
+      activityMoving = true;
+      messagesEl.appendChild(activityEl);
+      activityMoving = false;
+      if (stick) scrollToBottom();
+    }
+  }
+
+  new MutationObserver(() => {
+    if (!activityMoving) syncActivity();
+  }).observe(messagesEl, { childList: true });
+  const dockEl = document.getElementById('dialogDock');
+  if (dockEl) new MutationObserver(syncActivity).observe(dockEl, { childList: true });
+
   function setGeneratingUI(active) {
+    if (active && !isGenerating) {
+      activitySince = Date.now();
+      activityLabel = 'Thinking';
+      if (!activityTimer) activityTimer = setInterval(() => { if (activityEl) activityEl.querySelector('.activity-text').textContent = activityText(); }, 1000);
+    }
+    if (!active && activityTimer) {
+      clearInterval(activityTimer);
+      activityTimer = null;
+    }
     isGenerating = active;
     sendBtn.style.display = active ? 'none' : 'flex';
     stopBtn.style.display = active ? 'flex' : 'none';
+    syncActivity();
   }
 
   const slashMenu = document.createElement('div');
@@ -775,6 +840,65 @@
       ' &middot; ' + fmtTokens(total) + ' tok' + (running ? ' ...' : '') + '</span>';
     usageBtn.style.display = 'inline-flex';
   }
+
+  function limitsFraction(item) {
+    if (item.limit && item.remaining !== null && item.limit > 0) return item.remaining / item.limit;
+    return null;
+  }
+
+  function shortLabel(label) {
+    return label.replace('Requests per minute', 'req/min').replace('Requests per day', 'req/day').replace('Tokens per minute', 'tok/min').replace('Tokens per day', 'tok/day').replace('Requests', 'req').replace('Tokens', 'tok');
+  }
+
+  function updateLimits() {
+    if (!info.cloudProvider) {
+      limitsBtn.style.display = 'none';
+      return;
+    }
+    limitsBtn.style.display = 'inline-flex';
+    const items = (cloudLimits && cloudLimits.items) || [];
+    const known = items.filter((i) => limitsFraction(i) !== null);
+    if (known.length === 0) {
+      limitsBtn.innerHTML = icon('shield') + '<span>limits: not reported</span>';
+      limitsBtn.className = 'pill';
+      return;
+    }
+    known.sort((a, b) => limitsFraction(a) - limitsFraction(b));
+    const worst = known[0];
+    const frac = limitsFraction(worst);
+    limitsBtn.innerHTML = icon('shield') + '<span>' + fmtTokens(worst.remaining) + ' ' + escapeHtml(shortLabel(worst.label)) + ' left</span>';
+    limitsBtn.className = 'pill' + (frac < 0.1 ? ' limit-low' : frac < 0.3 ? ' limit-mid' : '');
+  }
+
+  limitsBtn.addEventListener('click', () => {
+    const items = [];
+    const data = cloudLimits;
+    const name = (data && data.provider) || info.cloudProvider || 'the provider';
+    if (!data || data.items.length === 0) {
+      items.push({ label: name + ' did not report limits yet', desc: 'Limits appear after the first answer. Some providers (for example Google Gemini) never send them: check the provider page.', disabled: true });
+    } else {
+      data.items.forEach((i) => {
+        const left = i.remaining !== null ? fmtTokens(i.remaining) : '?';
+        const total = i.limit !== null ? fmtTokens(i.limit) : '?';
+        const pct = limitsFraction(i);
+        items.push({
+          label: i.label + ': ' + left + ' of ' + total + ' left' + (pct !== null ? ' (' + Math.round(pct * 100) + '%)' : ''),
+          desc: i.reset ? 'resets in ' + i.reset : 'free-tier limit reported by ' + name,
+          disabled: true
+        });
+      });
+      if (data.retryAfter) items.push({ label: 'Last answer asked to wait ' + data.retryAfter, desc: 'The limit was reached', disabled: true });
+      if (data.at) items.push({ label: 'Updated ' + new Date(data.at).toLocaleTimeString(), desc: 'after the last model answer', disabled: true });
+    }
+    if (info.cloudProvider) {
+      items.push({
+        label: 'Open ' + name + ' limits page',
+        desc: 'Official numbers for your account',
+        onClick: () => post({ type: 'openCloudLimits', providerId: (cloudLimits && cloudLimits.providerId) || '' })
+      });
+    }
+    openMenu(limitsBtn, items);
+  });
 
   usageBtn.addEventListener('click', () => {
     const totals = usageTotals();
@@ -962,9 +1086,14 @@
 
   function applyInfo() {
     if (info.modelName) {
-      modelChip.innerHTML = icon('box') + '<span>' + escapeHtml(info.modelName) + '</span>';
-      modelChip.className = 'pill';
-      modelChip.title = info.modelName + ' - click to change the model';
+      const isCloud = !!info.cloudProvider;
+      const shown = isCloud ? info.modelName.split(':').slice(2).join(':') : info.modelName;
+      modelChip.innerHTML = icon('box') + '<span>' + escapeHtml(shown) + '</span>' +
+        (isCloud ? '<span class="cloud-pill">cloud</span>' : '');
+      modelChip.className = 'pill' + (isCloud ? ' is-cloud' : '');
+      modelChip.title = isCloud
+        ? shown + ' - cloud model: your messages and the files it reads are sent to ' + info.cloudProvider + '. Click to change the model.'
+        : info.modelName + ' - click to change the model';
     } else {
       modelChip.innerHTML = icon('warning') + '<span>Pick a model</span>';
       modelChip.className = 'pill warn';
@@ -1051,7 +1180,7 @@
       const item = document.createElement('div');
       item.className = 'session-row' + (sess.isCurrent ? ' current' : '');
       item.innerHTML =
-        '<span class="session-state">' + (sess.running ? '<span class="spinner"></span>' : sess.isCurrent ? icon('check') : '') + '</span>' +
+        '<span class="session-state">' + (sess.running ? spinnerHtml() : sess.isCurrent ? icon('check') : '') + '</span>' +
         '<span class="session-name">' + escapeHtml(sess.title || 'New chat') + '</span>' +
         '<span class="session-time">' + relativeTime(sess.updatedAt) + '</span>' +
         '<button class="session-del" title="Delete chat">' + icon('trash') + '</button>';
@@ -1195,9 +1324,19 @@
       { label: 'Attach a file', desc: 'Text or code file as context', onClick: () => post({ type: 'attachFile', kind: 'text' }) },
       {
         label: 'Attach an image',
-        desc: info.supportsVision ? 'Picture for the vision model' : 'Needs a vision model (e.g. gemma3)',
+        desc: info.supportsVision ? 'Picture for the vision model' : (info.cloudProvider ? 'This cloud model is text-only (try Llama 4 Scout or Gemini)' : 'Needs a vision model (e.g. gemma3)'),
         disabled: !info.supportsVision,
         onClick: () => post({ type: 'attachFile', kind: 'image' })
+      },
+      {
+        label: 'Git changes',
+        desc: 'Everything not committed yet, as a diff',
+        onClick: () => post({ type: 'attachContext', kind: 'git' })
+      },
+      {
+        label: 'Problems',
+        desc: 'Errors and warnings from the Problems panel',
+        onClick: () => post({ type: 'attachContext', kind: 'problems' })
       }
     ]);
   });
@@ -1271,6 +1410,7 @@
         currentRaw = '';
         currentBubble = addRow('<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>', 'assistant');
         setGeneratingUI(true);
+        setActivity('Thinking');
         break;
       case 'assistantReplace':
         if (currentBubble) {
@@ -1286,6 +1426,7 @@
           currentBubble = null;
           currentRaw = '';
         }
+        syncActivity();
         break;
       case 'toolProgress': {
         const card = toolCards[msg.id];
@@ -1297,6 +1438,10 @@
         }
         break;
       }
+      case 'cloudLimits':
+        cloudLimits = msg;
+        updateLimits();
+        break;
       case 'usage':
         usage = msg.usage || usage;
         updateUsage();
@@ -1321,6 +1466,10 @@
         }
         break;
       case 'assistantToken':
+        if (activityLabel !== 'Writing') {
+          activityLabel = 'Writing';
+          setTimeout(syncActivity, 0);
+        }
         if (currentBubble) {
           const wasNearBottom = isNearBottom();
           currentRaw += msg.text;
@@ -1351,6 +1500,8 @@
         lastGenStats = null;
         currentBubble = null;
         currentRaw = '';
+        setActivity('Thinking');
+        syncActivity();
         break;
       case 'replyDone':
         currentBubble = null;
@@ -1358,6 +1509,7 @@
         addRegenerateButton();
         break;
       case 'toolStart':
+        setActivity('Working on your project');
         if (historyPending.length > 0) {
           toolCards[msg.id] = historyPending.shift();
         } else {
@@ -1369,6 +1521,7 @@
         enqueueDialog(msg);
         break;
       case 'toolResult':
+        setActivity('Thinking');
         removeDialog(msg.id);
         if (toolCards[msg.id]) finishToolCard(toolCards[msg.id], msg.ok, msg.denied, msg.output, msg.diff, msg.diffMeta);
         break;
@@ -1377,7 +1530,18 @@
         if (msg.showStartServer) {
           html += '<div style="margin-top:8px;"><button id="startServerBtn" class="suggestion">' + icon('play') + ' Start Ollama server</button></div>';
         }
+        if (msg.fallbacks && msg.fallbacks.length) {
+          html += '<div class="fallbacks"><div class="fallbacks-title">Try another model:</div>' +
+            msg.fallbacks.map((f, i) => '<button class="suggestion fallback-btn" data-i="' + i + '" title="' + escapeHtml(f.provider || '') + '">' + escapeHtml(f.label) + ' <span class="fb-prov">' + escapeHtml(f.provider || '') + '</span></button>').join('') + '</div>';
+        }
         const errBubble = addRow(html, 'error');
+        errBubble.querySelectorAll('.fallback-btn').forEach((b) => {
+          b.onclick = () => {
+            const f = msg.fallbacks[Number(b.getAttribute('data-i'))];
+            errBubble.querySelectorAll('.fallback-btn').forEach((x) => { x.disabled = true; });
+            post({ type: 'switchModelAndRetry', model: f.name });
+          };
+        });
         const btn = errBubble.querySelector('#startServerBtn');
         if (btn) {
           btn.onclick = () => {
@@ -1389,6 +1553,22 @@
         if (!currentBubble) setGeneratingUI(false);
         break;
       }
+      case 'changesSummary': {
+        const old = document.getElementById('changesBar');
+        if (old) old.remove();
+        if (!msg.files || !msg.files.length) break;
+        const bar = document.createElement('div');
+        bar.id = 'changesBar';
+        bar.className = 'changes-bar';
+        const created = msg.files.filter((f) => f.isNew).length;
+        bar.innerHTML = '<span>' + msg.files.length + ' file' + (msg.files.length > 1 ? 's' : '') + ' changed' + (created ? ' (' + created + ' new)' : '') + '</span>' +
+          '<button class="suggestion" id="undoChanges">Undo all changes</button>';
+        bar.title = msg.files.map((f) => f.rel).join('\n');
+        messagesEl.appendChild(bar);
+        bar.querySelector('#undoChanges').onclick = () => post({ type: 'revertChanges' });
+        scrollToBottom();
+        break;
+      }
       case 'serverStartResult':
         addRow(escapeHtml(msg.text), msg.ok ? 'assistant' : 'error');
         break;
@@ -1398,6 +1578,8 @@
         break;
       case 'modelInfo':
         info = msg;
+        cloudLimits = msg.cloudLimits || null;
+        updateLimits();
         skills = msg.skills || [];
         applyInfo();
         break;

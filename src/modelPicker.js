@@ -6,9 +6,10 @@ const RECOMMENDED_MODELS = MODEL_CATALOG;
 
 async function pickAndInstallModel(ollamaClient, context) {
   const isRunning = await ollamaClient.ping();
-  if (!isRunning) {
+  const cloudModels = context.globalState.get('localAI.cloudModels', []);
+  if (!isRunning && cloudModels.length === 0) {
     const choice = await vscode.window.showErrorMessage(
-      "Could not connect to Ollama on localhost. Make sure Ollama is installed and running.",
+      "Could not connect to Ollama on localhost. Make sure Ollama is installed and running, or add a cloud model in the sidebar.",
       'How do I install it?'
     );
     if (choice === 'How do I install it?') {
@@ -18,10 +19,12 @@ async function pickAndInstallModel(ollamaClient, context) {
   }
 
   let localModels = [];
-  try {
-    localModels = await ollamaClient.listLocalModels();
-  } catch (err) {
-    vscode.window.showWarningMessage(`Could not fetch the list of local models: ${err.message}`);
+  if (isRunning) {
+    try {
+      localModels = await ollamaClient.listLocalModels();
+    } catch (err) {
+      vscode.window.showWarningMessage(`Could not fetch the list of local models: ${err.message}`);
+    }
   }
 
   const localNames = new Set(localModels.map((m) => m.name));
@@ -34,8 +37,23 @@ async function pickAndInstallModel(ollamaClient, context) {
       .join(' · ');
 
   const items = [];
+  if (cloudModels.length > 0) {
+    items.push({ label: 'Cloud (online, your messages leave this computer)', kind: Separator });
+    cloudModels.forEach((m) => {
+      items.push({
+        label: `$(cloud) ${m.modelId}`,
+        description: m.name === selected ? 'active' : (m.providerId || ''),
+        modelName: m.name,
+        alreadyInstalled: true
+      });
+    });
+  }
+  if (!isRunning) {
+    items.push({ label: 'This computer', kind: Separator });
+    items.push({ label: '$(warning) Ollama is not running', description: 'start it in the sidebar to use local models', modelName: undefined, disabled: true });
+  }
   if (localModels.length > 0) {
-    items.push({ label: 'Installed', kind: Separator });
+    items.push({ label: 'Installed on this computer', kind: Separator });
     localModels.forEach((m) => {
       items.push({
         label: `$(check) ${m.name}`,
@@ -51,7 +69,7 @@ async function pickAndInstallModel(ollamaClient, context) {
     ['general', 'General'],
     ['vision', 'Vision']
   ];
-  categories.forEach(([id, title]) => {
+  (isRunning ? categories : []).forEach(([id, title]) => {
     const available = RECOMMENDED_MODELS.filter((m) => m.category === id && !localNames.has(m.name));
     if (available.length === 0) return;
     items.push({ label: title, kind: Separator });
@@ -65,20 +83,22 @@ async function pickAndInstallModel(ollamaClient, context) {
     });
   });
 
-  items.push({ label: 'Other', kind: Separator });
-  items.push({
-    label: '$(edit) Enter a model name manually...',
-    description: 'any model from ollama.com/library',
-    modelName: null,
-    alreadyInstalled: false
-  });
+  if (isRunning) {
+    items.push({ label: 'Other', kind: Separator });
+    items.push({
+      label: '$(edit) Enter a model name manually...',
+      description: 'any model from ollama.com/library',
+      modelName: null,
+      alreadyInstalled: false
+    });
+  }
 
   const picked = await vscode.window.showQuickPick(items, {
     title: 'Local Full AI: pick a model',
     placeHolder: 'Choose from the list or type your own model name'
   });
 
-  if (!picked) return;
+  if (!picked || picked.disabled) return;
 
   let modelName = picked.modelName;
   if (modelName === null) {

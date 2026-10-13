@@ -1,3 +1,4 @@
+const loopGuard = require('./loopGuard');
 const http = require('http');
 const https = require('https');
 
@@ -180,7 +181,7 @@ class OllamaClient {
       };
 
       const handleLine = (line) => {
-        if (!line.trim()) return;
+        if (settled || !line.trim()) return;
         let evt;
         try {
           evt = JSON.parse(line);
@@ -274,7 +275,7 @@ class OllamaClient {
   }
 
   chatStream(modelName, messages, onToken, options = {}) {
-    const { onAbortReady, keepAlive, onStats, onThinking, tools, numCtx, generation } = options;
+    const { onAbortReady, keepAlive, onStats, onThinking, tools, numCtx, generation, onNotice } = options;
 
     return new Promise((resolve, reject) => {
       const payloadObj = {
@@ -297,6 +298,8 @@ class OllamaClient {
       let settled = false;
       let fullText = '';
       const toolCalls = [];
+      const watchLoop = loopGuard.makeWatcher();
+      let reqRef = null;
 
       const fail = (err) => {
         if (settled) return;
@@ -324,6 +327,15 @@ class OllamaClient {
           if (message.content) {
             fullText += message.content;
             if (onToken) onToken(message.content);
+            const cut = watchLoop(fullText);
+            if (cut >= 0 && !aborted) {
+              fullText = fullText.slice(0, cut);
+              aborted = true;
+              if (onNotice) onNotice('The model started repeating itself, so the answer was cut. This model is too weak for this task: pick a stronger one.');
+              if (reqRef) reqRef.destroy();
+              finish();
+              return;
+            }
           }
           if (Array.isArray(message.tool_calls)) {
             toolCalls.push(...message.tool_calls);
@@ -357,6 +369,7 @@ class OllamaClient {
         }
       );
 
+      reqRef = req;
       if (onAbortReady) {
         onAbortReady(() => {
           aborted = true;

@@ -6,6 +6,7 @@ const { SidebarProvider } = require('./sidebarProvider');
 const ollamaProcess = require('./ollamaProcess');
 const voice = require('./voice');
 const beforeContent = require('./beforeContent');
+const diagnostics = require('./diagnostics');
 
 let activeClient = null;
 
@@ -41,6 +42,14 @@ function activate(context) {
     })
   );
 
+  context.subscriptions.push(
+    vscode.commands.registerCommand('localAI.copyDiagnostics', async () => {
+      const text = await diagnostics.build(context, ollamaClient);
+      await vscode.env.clipboard.writeText(text);
+      vscode.window.showInformationMessage('Diagnostics copied. Paste it into your bug report: it has no keys, chats or file contents.');
+    })
+  );
+
   try {
     require('./skills').setPersistence(context.globalStorageUri.fsPath);
   } catch (_) {
@@ -52,7 +61,7 @@ function activate(context) {
     vscode.window.registerWebviewViewProvider('localAI.sidebar', sidebarProvider)
   );
 
-  console.log('Local Full AI activated. Runs fully locally through Ollama.');
+  console.log('Local Full AI activated.');
 }
 
 async function deactivate() {

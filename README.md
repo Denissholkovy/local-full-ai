@@ -1,9 +1,11 @@
 # Local Full AI
 
-A private AI coding assistant that runs **entirely on your computer**, powered by [Ollama](https://ollama.com).
+A private AI coding assistant that runs **on your computer by default**, powered by [Ollama](https://ollama.com).
+Local models too weak? You can optionally connect a **free cloud model** (Groq, OpenRouter, Google Gemini and others) with your own free key.
 Chat about your code, let it create and edit files in your project (with your approval), run on autopilot,
 split big jobs between helper agents, talk to it with your voice, and manage your models,
-all inside VS Code. No account, no API key, no subscription, and your code stays on your machine.
+all inside VS Code. Local use needs no account, no API key and no subscription, and your code stays on your machine.
+Cloud models are strictly opt-in and clearly marked.
 
 ## Highlights
 
@@ -27,6 +29,28 @@ all inside VS Code. No account, no API key, no subscription, and your code stays
 - Respects VS Code **Workspace Trust**: in Restricted Mode the AI can only chat.
 - When VS Code closes, everything the extension started is stopped (an Ollama installed as a system service keeps
   running, but its models are unloaded from memory).
+
+**Free cloud models, when local ones are too weak**
+- Settings > Cloud providers (or **Connect a cloud provider** in the sidebar): pick Groq, OpenRouter, Google Gemini,
+  Mistral, Cerebras or any OpenAI-compatible service, create a free API key on their site, paste it, and tick the models
+  you want. The list comes straight from the provider's API, so it is never out of date.
+- Cloud models work everywhere a local one does: project tools, autopilot, helper agents, skills, files steps.
+- Your key is kept in VS Code's secret storage. Before the first cloud message you must accept a notice that your
+  messages and the files the AI reads will be sent to that provider. The model chip shows a **cloud** badge and the
+  chat announces the switch. The extension never falls back from a local model to a cloud one by itself.
+- **Limits are visible.** Next to a cloud model the chat shows what is left (for example "450 tok left", turning orange
+  and red as it runs low); click it for every limit the provider reports (requests and tokens per minute/day, reset times)
+  and a link to the provider's limits page. Settings > Cloud providers shows the same per provider, and OpenRouter has a
+  **Check now** button for credit and quota. Providers that do not report limits (for example Google Gemini) say so.
+- **No surprise 429s.** The extension reads the remaining per-minute budget from the provider and waits for the reset before a request that would not fit. Busy providers (error 503) are retried automatically. If a model still fails, the chat offers your other cloud models with one click and retries the request.
+- Providers that publish it (OpenRouter) tell the extension which models see images and use tools, so this is read from the API instead of guessed from the name. Model lists mark weak models ("weak for agent", "basic agent", "agent-ready") so you know what to trust with project work.
+- Free tiers have limits (per minute, per day, tokens). When a limit is hit the chat waits and retries, then tells you
+  clearly. Cloud context is kept modest (`localAI.cloudContextSize`) to fit those limits. Limits and data policies are the
+  provider's and change over time; use each provider's **Limits** link.
+- **Built for small free limits.** For cloud models with a small per-minute token limit the extension switches to a
+  compact mode (shorter instructions, fewer and shorter tool descriptions, a small project snapshot, no skill list) and
+  sizes the request from the limit the provider reports, so one answer does not use up the whole minute. The project
+  files relevant to your request are shown to the model directly, so it does not waste requests searching for them.
 
 **Models made easy**
 - Guided Ollama setup, a hand-picked catalog (Code, General, Vision), cancel a download any time.
@@ -83,8 +107,11 @@ Most options are in the sidebar under **Settings**. The full list:
 | `localAI.workingFolder` | (empty) | Folder the AI works from (relative paths and commands). Empty means the open project folder. |
 | `localAI.unloadModelsOnClose` | on | When VS Code closes, unload the models from RAM if Ollama was started by something other than this extension. A server started by this extension is stopped completely. |
 | `localAI.autoSkills` | on | Pick the skills that match each request and give them to the model directly, so skills work with every model (no tool calling needed). |
+| `localAI.cloudContextSize` | 12000 | How many tokens of chat and project context are sent to a cloud model. Free tiers have small per-minute token limits, so keep this modest. |
 | `localAI.multiAgent` | on | Let the main chat start helper agents (delegate_task) for research and sub-tasks. |
 | `localAI.subagentModel` | (empty) | Model for research helper agents. Empty = same as the chat, "auto" = the smallest installed model, or an exact model name. A small model is fast for simple reading tasks; helpers that edit files always use the chat model. |
+| `localAI.language` | auto | Language of the sidebar and chat interface: "auto" follows VS Code, "en" English, "uk" Ukrainian. Applies when the panel is opened again. Messages from VS Code itself (pickers, notifications) stay in English. |
+| `localAI.voiceEngine` | local | Speech recognition for voice input: "local" (offline whisper.cpp, nothing leaves the computer) or "groq" (Groq Whisper in the cloud: fast and accurate, needs the Groq key, the recording is sent to Groq). |
 | `localAI.voiceLanguage` | auto | Language for voice input (whisper language code such as en, uk, ru) or auto to detect. |
 | `localAI.whisperBinaryPath` | (empty) | Path to whisper-cli (whisper.cpp). Empty means search PATH and Homebrew. |
 | `localAI.whisperModelPath` | (empty) | Path to a whisper.cpp ggml model. Empty means ~/.local-full-ai/whisper/ggml-base.bin. |
@@ -95,11 +122,15 @@ Most options are in the sidebar under **Settings**. The full list:
 - **Local Full AI: Select / Download Model** (`localAI.selectModel`)
 - **Local Full AI: Open Chat** (`localAI.openChat`)
 - **Local Full AI: Ask About Selected Code** (`localAI.askAboutSelection`)
+- **Local Full AI: Copy Diagnostics for a Bug Report** (`localAI.copyDiagnostics`): versions, settings and recent errors, with keys, chats and file contents left out
 
 ## Privacy and network
 
-- Chats, files and skills are processed by your local Ollama. Nothing is sent to any AI service.
-- The extension talks to the network only to: download models (Ollama), load the list of quantization variants
+- With a local model, chats, files and skills are processed by your local Ollama and nothing is sent to any AI service.
+- Only if you connect a cloud provider **and** select one of its models, your messages and the files the AI reads are sent
+  to that provider. Free tiers of some providers may use prompts to improve their products. Do not use cloud models for
+  private or sensitive code.
+- Otherwise the extension talks to the network only to: download models (Ollama), load the list of quantization variants
   from `ollama.com`, and, if you set up voice input, download a speech model from Hugging Face.
 - Chat history is stored in VS Code's local storage on your computer. Delete a chat from the chat list to remove it.
 - Commands the AI runs are executed in your project folder and always need your approval, except in Autopilot, where

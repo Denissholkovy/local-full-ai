@@ -685,3 +685,23 @@ button:focus-visible, textarea:focus-visible { outline: 1px solid var(--accent);
 
 .pill { max-width: 300px; }
 #modelChip span { max-width: 240px; }
+
+.cloud-pill { font-size: 9.5px; padding: 1px 6px; border-radius: 8px; background: rgba(80,140,255,0.25); color: var(--vscode-textLink-foreground, #6cb6ff); flex-shrink: 0; }
+.pill.is-cloud { box-shadow: inset 0 0 0 1px rgba(80,140,255,0.45); }
+
+.pill.limit-mid { box-shadow: inset 0 0 0 1px #d9822b; }
+.pill.limit-low { box-shadow: inset 0 0 0 1px var(--vscode-errorForeground); color: var(--vscode-errorForeground); }
+.fallbacks { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.fallbacks-title { font-size: 11px; opacity: 0.8; width: 100%; }
+.fb-prov { opacity: 0.6; font-size: 10px; margin-left: 4px; }
+.changes-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0; padding: 8px 12px; border: 1px solid var(--vscode-panel-border, rgba(127,127,127,0.3)); border-radius: 8px; font-size: 12px; }
+.changes-bar button { border: 1px solid var(--vscode-button-border, rgba(127,127,127,0.5)); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+.changes-bar button:hover { background: rgba(127,127,127,0.18); }
+
+.activity {
+  display: flex; align-items: center; gap: 4px;
+  margin: 6px 4px 2px; padding: 4px 2px;
+  font-size: 12px; color: var(--vscode-descriptionForeground, inherit); opacity: 0.85;
+}
+.activity .typing-dot { width: 5px; height: 5px; margin-right: 2px; }
+.activity-text { margin-left: 4px; }

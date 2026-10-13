@@ -48,6 +48,10 @@ function summary() {
     contextSize: ctx,
     contextLabel: ctx >= 1024 ? `${Math.round(ctx / 1024)}K tokens` : `${ctx} tokens`,
     gpuLabel: gpu < 0 ? 'Auto' : gpu === 0 ? 'CPU only' : `${gpu} layers`,
+    cloudContextLabel: (() => {
+      const n = numberOr(cfg.get('cloudContextSize'), 12000);
+      return `${Math.round(n / 1000)}K tokens`;
+    })(),
     helperLabel: (() => {
       const h = String(cfg.get('subagentModel') || '').trim();
       return !h ? 'Same as chat' : h === 'auto' ? 'Auto (smallest installed)' : h;

@@ -2,24 +2,27 @@
   "name": "local-full-ai",
   "displayName": "Local Full AI",
   "publisher": "Denys-Shovkovyi",
-  "description": "A private, fully local AI coding assistant for VS Code, powered by Ollama: chat, edit your project with approval, autopilot, helper agents, voice input and model management. No account, no cloud.",
-  "version": "0.1.0",
+  "description": "A private AI coding assistant for VS Code, powered by local Ollama models, with optional free cloud models when local ones are too weak: chat, edit your project with approval, autopilot, helper agents, voice input and model management.",
+  "version": "0.1.1",
   "license": "MIT",
   "icon": "media/icon.png",
   "keywords": [
+    "agent",
     "ai",
-    "ollama",
-    "local",
-    "offline",
-    "llm",
+    "autopilot",
     "chat",
     "coding assistant",
-    "agent",
-    "autopilot",
+    "gemini",
+    "groq",
+    "llm",
+    "local",
+    "offline",
+    "ollama",
+    "openrouter",
     "private",
     "qwen",
-    "whisper",
-    "skills"
+    "skills",
+    "whisper"
   ],
   "repository": {
     "type": "git",
@@ -66,6 +69,10 @@
       {
         "command": "localAI.askAboutSelection",
         "title": "Local Full AI: Ask About Selected Code"
+      },
+      {
+        "command": "localAI.copyDiagnostics",
+        "title": "Local Full AI: Copy Diagnostics for a Bug Report"
       }
     ],
     "menus": {
@@ -184,6 +191,12 @@
           "default": true,
           "description": "Pick the skills that match each request and give them to the model directly, so skills work with every model (no tool calling needed)."
         },
+        "localAI.cloudContextSize": {
+          "type": "number",
+          "default": 12000,
+          "minimum": 2048,
+          "description": "How many tokens of chat and project context are sent to a cloud model. Free tiers have small per-minute token limits, so keep this modest."
+        },
         "localAI.multiAgent": {
           "type": "boolean",
           "default": true,
@@ -193,6 +206,25 @@
           "type": "string",
           "default": "",
           "description": "Model for research helper agents. Empty = same as the chat, \"auto\" = the smallest installed model, or an exact model name. A small model is fast for simple reading tasks; helpers that edit files always use the chat model."
+        },
+        "localAI.language": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "en",
+            "uk"
+          ],
+          "default": "auto",
+          "description": "Language of the sidebar and chat interface: \"auto\" follows VS Code, \"en\" English, \"uk\" Ukrainian. Applies when the panel is opened again. Messages from VS Code itself (pickers, notifications) stay in English."
+        },
+        "localAI.voiceEngine": {
+          "type": "string",
+          "enum": [
+            "local",
+            "groq"
+          ],
+          "default": "local",
+          "description": "Speech recognition for voice input: \"local\" (offline whisper.cpp, nothing leaves the computer) or \"groq\" (Groq Whisper in the cloud: fast and accurate, needs the Groq key, the recording is sent to Groq)."
         },
         "localAI.voiceLanguage": {
           "type": "string",
@@ -224,7 +256,10 @@
     }
   },
   "scripts": {
-    "lint": "echo \"(no lint configured)\""
+    "lint": "echo \"(no lint configured)\"",
+    "package": "vsce package --no-dependencies",
+    "release:patch": "npm version patch -m \"Release %s\" && git push --follow-tags",
+    "release:minor": "npm version minor -m \"Release %s\" && git push --follow-tags"
   },
   "devDependencies": {
     "@types/vscode": "^1.85.0"

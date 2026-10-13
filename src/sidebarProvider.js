@@ -8,6 +8,10 @@ const voice = require('./voice');
 const modelTags = require('./modelTags');
 const generationLib = require('./generation');
 const hardware = require('./hardware');
+const cloud = require('./cloudProviders');
+const { isVisionModel, cloudCap } = require('./modelCapabilities');
+const { CloudClient } = require('./cloudClient');
+const cloudLimits = require('./cloudLimits');
 const workspaceLib = require('./workspace');
 const { resolveWorkspaceRoot } = workspaceLib;
 
@@ -18,6 +22,7 @@ class SidebarProvider {
     this._view = null;
     this._pullInProgress = new Set();
     this._pullAborts = new Map();
+    this._cloudClient = new CloudClient(context);
   }
 
   resolveWebviewView(webviewView) {
@@ -83,6 +88,46 @@ class SidebarProvider {
           await vscode.workspace.getConfiguration('localAI').update('workingFolder', value, vscode.ConfigurationTarget.Global);
           break;
         }
+        case 'cloudSetKey':
+          await this._cloudSetKey(msg.providerId);
+          break;
+        case 'cloudPickModels':
+          await this._cloudPickModels(msg.providerId);
+          break;
+        case 'cloudCheckLimits': {
+          try {
+            const entry = await this._cloudClient.accountInfo(msg.providerId);
+            if (!entry) vscode.window.showInformationMessage('This provider has no limits query. Limits are shown after the first model answer.');
+          } catch (err) {
+            vscode.window.showErrorMessage(`Could not check the limits: ${err.message}`);
+          }
+          await this._refreshState();
+          break;
+        }
+        case 'cloudRemoveKey':
+          await this._cloudRemoveKey(msg.providerId);
+          break;
+        case 'cloudTestModel': {
+          const r = await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title: 'Testing the model...' },
+            () => this._cloudClient.testModel(msg.name)
+          );
+          if (r.ok) vscode.window.showInformationMessage('The model answers: it works.');
+          else vscode.window.showWarningMessage(r.error);
+          break;
+        }
+        case 'cloudRemoveModel':
+          await this._cloudRemoveModel(msg.name);
+          break;
+        case 'cloudOpenPage': {
+          const def = cloud.provider(msg.providerId);
+          const url = msg.which === 'limits' ? def && def.limitsUrl : def && def.keyUrl;
+          if (url) vscode.env.openExternal(vscode.Uri.parse(url));
+          break;
+        }
+        case 'cloudConnect':
+          await this._cloudConnect();
+          break;
         case 'cancelPull': {
           const abort = this._pullAborts.get(msg.modelName);
           if (abort) abort();
@@ -97,11 +142,17 @@ class SidebarProvider {
         case 'chooseContext':
           await this._chooseContext();
           break;
+        case 'chooseCloudContext':
+          await this._chooseCloudContext();
+          break;
         case 'chooseGpu':
           await this._chooseGpu();
           break;
         case 'chooseHelperModel':
           await this._chooseHelperModel();
+          break;
+        case 'chooseVoiceEngine':
+          await this._chooseVoiceEngine();
           break;
         case 'setupVoice':
           voice.openSetupTerminal();
@@ -154,10 +205,20 @@ class SidebarProvider {
     });
     const folderWatcher = vscode.workspace.onDidChangeWorkspaceFolders(() => this._refreshState());
     const modelWatcher = modelState.onDidChange(() => this._refreshState());
+    let limitsTimer = null;
+    const limitsWatcher = cloudLimits.onDidChange(() => {
+      if (limitsTimer) return;
+      limitsTimer = setTimeout(() => {
+        limitsTimer = null;
+        this._refreshState();
+      }, 2000);
+    });
     webviewView.onDidDispose(() => {
       configWatcher.dispose();
       folderWatcher.dispose();
       modelWatcher.dispose();
+      limitsWatcher.dispose();
+      if (limitsTimer) clearTimeout(limitsTimer);
     });
 
     this._refreshState();
@@ -169,6 +230,24 @@ class SidebarProvider {
       workspaceRoot: resolveWorkspaceRoot(),
       extraFolders: config.get('extraSkillFolders') || []
     });
+  }
+
+  async _chooseVoiceEngine() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    const current = config.get('voiceEngine') === 'groq' ? 'groq' : 'local';
+    const picked = await vscode.window.showQuickPick(
+      [
+        { label: `${current === 'local' ? '$(check) ' : ''}Local (offline whisper.cpp)`, detail: 'Nothing leaves your computer. Needs a one-time setup and is slower on weak machines.', value: 'local' },
+        { label: `${current === 'groq' ? '$(check) ' : ''}Groq Whisper (cloud)`, detail: 'Fast and accurate, good with Ukrainian, nothing to install. Needs the Groq key; each recording is sent to Groq.', value: 'groq' }
+      ],
+      { title: 'Which speech recognition should voice input use?' }
+    );
+    if (!picked) return;
+    await config.update('voiceEngine', picked.value, vscode.ConfigurationTarget.Global);
+    if (picked.value === 'groq' && !(await this._context.secrets.get('localAI.key.groq'))) {
+      vscode.window.showInformationMessage('Add your Groq key in the Cloud tab (Providers) to use it for voice.');
+    }
+    await this._refreshState();
   }
 
   async _removeVoice() {
@@ -257,6 +336,182 @@ class SidebarProvider {
       if (level === 'full' && workspace.includes(folderPath)) return rest;
       return [...rest, { path: folderPath, level }];
     });
+  }
+
+  async _cloudState() {
+    const providers = [];
+    for (const p of cloud.PROVIDERS) {
+      const hasKey = !!(await this._context.secrets.get(`localAI.key.${p.id}`));
+      const seen = cloudLimits.get(p.id);
+      providers.push({
+        id: p.id,
+        name: p.name,
+        hasKey,
+        hasKeyPage: !!p.keyUrl,
+        hasLimits: !!p.limitsUrl,
+        canCheck: p.id === 'openrouter',
+        note: p.note,
+        dataNote: p.dataNote,
+        limits: seen ? { at: seen.at, model: seen.model, items: seen.items, retryAfter: seen.retryAfter } : null
+      });
+    }
+    const models = this._context.globalState.get('localAI.cloudModels', []).map((m) => ({
+      ...m,
+      tier: cloudCap(m.name, 'tools') === false ? 'notools' : cloud.rank(m.modelId),
+      vision: isVisionModel(m.name)
+    }));
+    return { providers, models };
+  }
+
+  async _cloudConnect() {
+    const items = (await this._cloudState()).providers.map((p) => {
+      const def = cloud.provider(p.id);
+      return { label: `${p.hasKey ? '$(check) ' : ''}${p.name}`, description: p.hasKey ? 'key saved' : def.keyUrl ? 'free key available' : '', detail: p.note, id: p.id };
+    });
+    const picked = await vscode.window.showQuickPick(items, {
+      title: 'Connect a cloud provider',
+      placeHolder: 'Local models too weak? Pick a provider with a free tier. Your prompts are sent to it.'
+    });
+    if (!picked) return;
+    const state = (await this._cloudState()).providers.find((p) => p.id === picked.id);
+    if (state && state.hasKey) await this._cloudPickModels(picked.id);
+    else await this._cloudSetKey(picked.id, true);
+  }
+
+  async _cloudSetKey(providerId, offerKeyPage) {
+    const def = cloud.provider(providerId);
+    if (!def) return;
+    if (providerId === 'custom') {
+      const url = await vscode.window.showInputBox({
+        prompt: 'Address of the OpenAI-compatible API (the part before /chat/completions)',
+        placeHolder: 'https://example.com/v1',
+        value: this._context.globalState.get('localAI.cloudCustomUrl') || '',
+        validateInput: (v) => (/^https?:\/\/\S+$/.test(v) ? null : 'Enter a full address starting with http:// or https://')
+      });
+      if (!url) return;
+      await this._context.globalState.update('localAI.cloudCustomUrl', url.replace(/\/+$/, ''));
+    } else if (offerKeyPage && def.keyUrl) {
+      const choice = await vscode.window.showInformationMessage(
+        `${def.name}: create a free API key on their site, then paste it here.`,
+        'Open the key page',
+        'I already have a key'
+      );
+      if (!choice) return;
+      if (choice === 'Open the key page') vscode.env.openExternal(vscode.Uri.parse(def.keyUrl));
+    }
+    const key = await vscode.window.showInputBox({
+      prompt: `Paste your ${def.name} API key. It is stored in VS Code's secret storage, not in settings.`,
+      password: true,
+      ignoreFocusOut: true,
+      validateInput: (v) => (v.trim().length >= 8 ? null : 'That looks too short for an API key')
+    });
+    if (!key) return;
+    await this._context.secrets.store(`localAI.key.${providerId}`, key.trim());
+    await this._refreshState();
+    await this._cloudPickModels(providerId);
+  }
+
+  async _cloudPickModels(providerId) {
+    const def = cloud.provider(providerId);
+    if (!def) return;
+    let ids;
+    try {
+      ids = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `Loading models from ${def.name}...` },
+        () => this._cloudClient.listModels(providerId)
+      );
+    } catch (err) {
+      const choice = await vscode.window.showErrorMessage(`${def.name}: ${err.message}`, 'Change the key');
+      if (choice === 'Change the key') await this._cloudSetKey(providerId);
+      return;
+    }
+    const available = cloud.filterModels(def, ids);
+    if (available.length === 0) {
+      vscode.window.showInformationMessage(def.onlyFree ? `${def.name} returned no free models right now. Try again later.` : `${def.name} returned no chat models.`);
+      return;
+    }
+    const current = this._context.globalState.get('localAI.cloudModels', []);
+    const chosen = new Set(current.filter((m) => m.providerId === providerId).map((m) => m.modelId));
+    const picked = await vscode.window.showQuickPick(
+      [
+        ...['best', 'ok', 'weak'].flatMap((tier) => {
+          const ids = available.filter((id) => cloud.rank(id) === tier);
+          if (!ids.length) return [];
+          const title = tier === 'best' ? 'Recommended: strong at code and tools' : tier === 'ok' ? 'Other chat models' : 'Small or fast models: weaker at agent tasks';
+          return [
+            { label: title, kind: vscode.QuickPickItemKind.Separator },
+            ...ids.map((id) => ({
+              label: id,
+              picked: chosen.has(id),
+              description: [tier === 'best' ? '\u2605 recommended' : '', isVisionModel(`cloud:${providerId}:${id}`) ? 'sees images' : '', cloudCap(`cloud:${providerId}:${id}`, 'tools') === false ? 'no tools: cannot edit your project' : ''].filter(Boolean).join(' \u00b7 ')
+            }))
+          ];
+        })
+      ],
+      {
+        title: `Models to add from ${def.name}`,
+        placeHolder: def.onlyFree ? 'Only free models are listed. Tick the ones you want, then press Enter.' : 'Tick the models you want, then press Enter. Check the provider limits: not every model is free.',
+        canPickMany: true,
+        matchOnDescription: true
+      }
+    );
+    if (!picked) return;
+    const others = current.filter((m) => m.providerId !== providerId);
+    const added = picked.map((i) => ({ name: cloud.makeName(providerId, i.label), providerId, modelId: i.label }));
+    await this._context.globalState.update('localAI.cloudModels', [...others, ...added]);
+    await this._verifyCloudModels(providerId, added.filter((m) => !chosen.has(m.modelId)));
+    if (added.length > 0 && !this._context.globalState.get('localAI.selectedModel')) {
+      await modelState.setSelectedModel(this._context, added[0].name);
+    }
+    await this._refreshState();
+  }
+
+  async _verifyCloudModels(providerId, added) {
+    if (!added.length) return;
+    const bad = [];
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: 'Checking that the new models answer...' },
+      async () => {
+        for (const m of added.slice(0, 6)) {
+          const r = await this._cloudClient.testModel(m.name);
+          if (!r.ok && !r.busy) bad.push({ m, error: r.error });
+        }
+      }
+    );
+    if (!bad.length) {
+      vscode.window.showInformationMessage(`${added.length} model${added.length > 1 ? 's' : ''} checked: working.`);
+      return;
+    }
+    const list = bad.map((b) => `${b.m.modelId}: ${b.error.slice(0, 140)}`).join('\n');
+    const choice = await vscode.window.showWarningMessage(`These models do not work with your key:\n${list}`, { modal: true }, 'Remove them');
+    if (choice === 'Remove them') {
+      const names = new Set(bad.map((b) => b.m.name));
+      const current = this._context.globalState.get('localAI.cloudModels', []);
+      await this._context.globalState.update('localAI.cloudModels', current.filter((m) => !names.has(m.name)));
+      const selected = this._context.globalState.get('localAI.selectedModel');
+      if (names.has(selected)) await modelState.setSelectedModel(this._context, null);
+      await this._refreshState();
+    }
+  }
+
+  async _cloudRemoveKey(providerId) {
+    const def = cloud.provider(providerId);
+    const confirm = await vscode.window.showWarningMessage(`Remove the ${def.name} key and its models from this extension?`, { modal: true }, 'Remove');
+    if (confirm !== 'Remove') return;
+    await this._context.secrets.delete(`localAI.key.${providerId}`);
+    const current = this._context.globalState.get('localAI.cloudModels', []);
+    await this._context.globalState.update('localAI.cloudModels', current.filter((m) => m.providerId !== providerId));
+    const selected = this._context.globalState.get('localAI.selectedModel');
+    const parsed = cloud.parseName(selected);
+    if (parsed && parsed.providerId === providerId) await modelState.setSelectedModel(this._context, undefined);
+    await this._refreshState();
+  }
+
+  async _cloudRemoveModel(name) {
+    const current = this._context.globalState.get('localAI.cloudModels', []);
+    await this._context.globalState.update('localAI.cloudModels', current.filter((m) => m.name !== name));
+    if (this._context.globalState.get('localAI.selectedModel') === name) await modelState.setSelectedModel(this._context, undefined);
+    await this._refreshState();
   }
 
   async _chooseVariant(modelName) {
@@ -405,7 +660,7 @@ class SidebarProvider {
     const models = await this._ollamaClient.listLocalModels().catch(() => []);
     const items = [
       { label: `${current === '' ? '$(check) ' : ''}Same model as the chat`, description: 'default', detail: 'Helpers use the model you chat with.', value: '' },
-      { label: `${current === 'auto' ? '$(check) ' : ''}Auto: the smallest installed model`, description: 'fast helpers', detail: 'Research helpers use your smallest installed model that is smaller than the chat model. Helpers that edit files always use the chat model.', value: 'auto' },
+      { label: `${current === 'auto' ? '$(check) ' : ''}Auto: the smallest installed model`, description: 'fast helpers', detail: 'With a local chat model, research helpers use your smallest installed model that is smaller than it. With a cloud chat model, helpers use that same cloud model. Helpers that edit files always use the chat model.', value: 'auto' },
       { label: 'Installed models', kind: vscode.QuickPickItemKind.Separator },
       ...models
         .slice()
@@ -429,6 +684,25 @@ class SidebarProvider {
     });
     if (!picked || picked.value === undefined) return;
     await config.update('subagentModel', picked.value, vscode.ConfigurationTarget.Global);
+  }
+
+  async _chooseCloudContext() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    const current = Number(config.get('cloudContextSize')) || 12000;
+    const sizes = [4000, 6000, 8000, 12000, 16000, 32000];
+    const notes = {
+      4000: 'safest for very small free limits',
+      6000: 'fits tiny per-minute limits (compact mode)',
+      8000: 'compact mode up to here',
+      12000: 'default',
+      16000: 'longer chats, needs a bigger free limit',
+      32000: 'only for providers with large limits'
+    };
+    const picked = await vscode.window.showQuickPick(
+      sizes.map((n) => ({ label: `${n === current ? '$(check) ' : ''}${Math.round(n / 1000)}K tokens`, description: notes[n], value: n })),
+      { title: 'Cloud context size (how much is sent to a cloud model)', placeHolder: 'Free tiers allow only a few thousand tokens per minute. The extension also lowers this automatically from the limit the provider reports.' }
+    );
+    if (picked) await config.update('cloudContextSize', picked.value, vscode.ConfigurationTarget.Global);
   }
 
   async _chooseGpu() {
@@ -694,13 +968,35 @@ class SidebarProvider {
     await this._refreshState();
   }
 
+  async _commonState() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    return {
+      selectedModel: this._context.globalState.get('localAI.selectedModel') || null,
+      systemPrompt: this._context.globalState.get('localAI.systemPrompt') || '',
+      keepAlive: this._context.globalState.get('localAI.keepAlive') || '',
+      includeActiveFile: this._context.globalState.get('localAI.includeActiveFile', false),
+      voice: voice.info(),
+      generation: generationLib.summary(),
+      cloud: await this._cloudState(),
+      folders: this._folderState(),
+      skills: {
+        enabled: config.get('useClaudeSkills') !== false,
+        auto: config.get('autoSkills') !== false,
+        cache: skillsLib.cacheInfo(),
+        ...this._skillSources()
+      }
+    };
+  }
+
   async _refreshState() {
     if (!this._view) return;
+    const common = await this._commonState();
 
     const isRunning = await this._ollamaClient.ping();
     if (!isRunning) {
       this._view.webview.postMessage({
         type: 'ollamaNotRunning',
+        ...common,
         installed: !!ollamaProcess.findBinary(),
         binary: ollamaProcess.findBinary()
       });
@@ -720,30 +1016,14 @@ class SidebarProvider {
       params: (m.details && m.details.parameter_size) || '',
       sizeGB: m.size ? m.size / (1024 * 1024 * 1024) : 0
     }));
-    const selectedModel = this._context.globalState.get('localAI.selectedModel') || null;
-    const systemPrompt = this._context.globalState.get('localAI.systemPrompt') || '';
-    const keepAlive = this._context.globalState.get('localAI.keepAlive') || '';
-    const includeActiveFile = this._context.globalState.get('localAI.includeActiveFile', false);
 
     this._view.webview.postMessage({
       type: 'ollamaReady',
+      ...common,
       installedModels: installed,
       recommendedModels: RECOMMENDED_MODELS,
       totalRamGB: require('os').totalmem() / (1024 * 1024 * 1024),
-      selectedModel,
-      systemPrompt,
-      keepAlive,
-      includeActiveFile,
-      voice: voice.info(),
-      generation: generationLib.summary(),
-      hardware: this._hardwareState(),
-      folders: this._folderState(),
-      skills: {
-        enabled: vscode.workspace.getConfiguration('localAI').get('useClaudeSkills') !== false,
-        auto: vscode.workspace.getConfiguration('localAI').get('autoSkills') !== false,
-        cache: skillsLib.cacheInfo(),
-        ...this._skillSources()
-      }
+      hardware: this._hardwareState()
     });
   }
 
@@ -822,6 +1102,11 @@ class SidebarProvider {
   _getHtml() {
     const media = (...parts) =>
       this._view.webview.asWebviewUri(vscode.Uri.joinPath(this._context.extensionUri, 'media', ...parts));
+    const uiLang = (() => {
+      const setting = vscode.workspace.getConfiguration('localAI').get('language') || 'auto';
+      if (setting === 'en' || setting === 'uk') return setting;
+      return String(vscode.env.language || 'en').toLowerCase().startsWith('uk') ? 'uk' : 'en';
+    })();
     const iconMap = JSON.stringify(ICONS).replace(/</g, '\\u003c');
 
     return `<!DOCTYPE html>
@@ -832,7 +1117,8 @@ class SidebarProvider {
 </head>
 <body>
   <div id="content"></div>
-<script>window.ICONS = ${iconMap};</script>
+<script>window.ICONS = ${iconMap}; window.__LANG = ${JSON.stringify(uiLang)};</script>
+<script src="${media('i18n.js')}"></script>
 <script src="${media('sidebar', 'sidebar.js')}"></script>
 </body>
 </html>`;

@@ -58,8 +58,16 @@ function recorderSpec(file) {
   return null;
 }
 
+function engine() {
+  return vscode.workspace.getConfiguration('localAI').get('voiceEngine') === 'groq' ? 'groq' : 'local';
+}
+
 function missing() {
   const list = [];
+  if (engine() === 'groq') {
+    if (!recorderSpec('x.wav')) list.push('audio recorder (sox)');
+    return list;
+  }
   if (!findWhisper()) list.push('whisper.cpp');
   if (!findModel()) list.push('speech model');
   if (!recorderSpec('x.wav')) list.push('audio recorder (sox)');
@@ -208,6 +216,34 @@ function transcribe(wavBuffer, language) {
   });
 }
 
+async function transcribeGroq(wavBuffer, language, apiKey) {
+  const form = new FormData();
+  form.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'audio.wav');
+  form.append('model', 'whisper-large-v3-turbo');
+  form.append('response_format', 'text');
+  form.append('temperature', '0');
+  if (language && language !== 'auto') form.append('language', language);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60000);
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: form,
+      signal: controller.signal
+    });
+    if (res.status === 401 || res.status === 403) throw new Error('Groq rejected the API key. Check it in the sidebar under Cloud.');
+    if (res.status === 429) throw new Error('Groq free limit for speech recognition is used up for now. Try again in a minute.');
+    if (!res.ok) throw new Error(`Groq speech recognition failed (${res.status}): ${(await res.text()).slice(0, 160)}`);
+    return (await res.text()).replace(/\s+/g, ' ').trim();
+  } catch (err) {
+    if (err && err.name === 'AbortError') throw new Error('Groq did not answer in time.');
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function recorderName() {
   const spec = recorderSpec('x.wav');
   return spec ? path.basename(spec.bin) : null;
@@ -227,12 +263,13 @@ function info() {
     modelMB = 0;
   }
   return {
+    engine: engine(),
     whisper,
     model,
     modelMB,
     modelIsOurs: isOurModel(model),
     recorder: recorderName(),
-    ready: !!(whisper && model && recorderName()),
+    ready: engine() === 'groq' ? !!recorderName() : !!(whisper && model && recorderName()),
     canUninstallWhisper: !!uninstallCommand()
   };
 }
@@ -291,6 +328,8 @@ module.exports = {
   runInTerminal,
   startRecording,
   transcribe,
+  transcribeGroq,
+  engine,
   openSetupTerminal,
   cancelAll
 };

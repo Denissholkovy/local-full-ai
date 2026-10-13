@@ -1,162 +1,4 @@
-const vscode = require('vscode');
-const fs = require('fs');
-const path = require('path');
-const { ICONS } = require('./icons');
-const { isVisionModel } = require('./modelCapabilities');
-const ollamaProcess = require('./ollamaProcess');
-const { WorkspaceTools, normalizeArgs, truncate } = require('./tools');
-const skillsLib = require('./skills');
-const workspaceLib = require('./workspace');
-const { resolveWorkspaceRoot } = workspaceLib;
-const agentTools = require('./agentTools');
-const voice = require('./voice');
-const modelState = require('./modelState');
-const agentFiles = require('./agentFiles');
-const generationLib = require('./generation');
-const beforeContent = require('./beforeContent');
-const projectCheck = require('./projectCheck');
-const MODEL_CATALOG = require('./models.json');
-const { spawn } = require('child_process');
-
-const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
-const TEXT_FILE_EXTENSIONS = [
-  'txt', 'md', 'js', 'ts', 'jsx', 'tsx', 'py', 'json', 'html', 'css', 'java', 'go', 'rs', 'c', 'cpp', 'log'
-];
-const MAX_TEXT_FILE_CHARS = 12000;
-const MAX_TOOL_RESULT_CHARS = 8000;
-const VOICE_MAX_MS = 120000;
-const MAX_AGENT_STEPS = 25;
-const MAX_DUMP_NUDGES = 2;
-const CONTEXT_FILE_CHARS = 6000;
-const CONTEXT_TOTAL_CHARS = 14000;
-const AUTOPILOT_MAX_STEPS = 400;
-const MAX_NUDGES = 6;
-const MAX_REPEAT_WARNINGS = 3;
-const SUBAGENT_MAX_STEPS = { research: 25, worker: 40 };
-const MAX_SUBAGENT_REPORT_CHARS = 6000;
-const RETRY_DELAY_MS = 4000;
-const MAX_RETRIES = 6;
-const DEFAULT_CONTEXT_SIZE = 16384;
-const CHARS_PER_TOKEN = 2.5;
-
-const LANGUAGE_BY_EXTENSION = {
-  '.js': 'javascript',
-  '.ts': 'typescript',
-  '.jsx': 'javascript',
-  '.tsx': 'typescript',
-  '.py': 'python',
-  '.json': 'json',
-  '.html': 'html',
-  '.css': 'css',
-  '.java': 'java',
-  '.go': 'go',
-  '.rs': 'rust',
-  '.c': 'c',
-  '.cpp': 'cpp',
-  '.md': 'markdown',
-  '.txt': '',
-  '.log': ''
-};
-
-function estimateChars(messages) {
-  return messages.reduce((sum, m) => {
-    let size = typeof m.content === 'string' ? m.content.length : 0;
-    if (m.tool_calls) size += JSON.stringify(m.tool_calls).length;
-    return sum + size;
-  }, 0);
-}
-
-function trimMessagesToFit(messages, maxChars) {
-  const systemMsgs = messages.filter((m) => m.role === 'system');
-  const rest = messages.filter((m) => m.role !== 'system');
-  let trimmed = false;
-
-  while (estimateChars([...systemMsgs, ...rest]) > maxChars && rest.length > 2) {
-    rest.shift();
-    trimmed = true;
-  }
-  while (trimmed && rest.length > 1 && rest[0].role !== 'user') {
-    rest.shift();
-  }
-
-  return { messages: [...systemMsgs, ...rest], trimmed };
-}
-
-function modelSupportsTools(name) {
-  const entry = MODEL_CATALOG.find((m) => m.name === name);
-  return entry ? (entry.tags || []).includes('tools') : true;
-}
-
-function languageNote(lang) {
-  if (!lang || lang === 'English') return '';
-  return `IMPORTANT: the user writes in ${lang}. Write ALL your replies to the user in ${lang}, including short summaries after tool calls. Code, file names and identifiers stay unchanged.`;
-}
-
-function isSmallModel(name) {
-  const m = String(name || '').match(/(\d+(?:\.\d+)?)b\b/i);
-  return !!m && Number(m[1]) < 13;
-}
-
-function displayTitle(message) {
-  const display = message.display;
-  if (display && display.text) return display.text;
-  if (display && display.attachments && display.attachments.length) return display.attachments[0].name;
-  return typeof message.content === 'string' ? message.content : '';
-}
-
-function capDiff(diff) {
-  if (!diff) return null;
-  return { added: diff.added, removed: diff.removed, isNew: diff.isNew, lines: diff.lines.slice(0, 100) };
-}
-
-function toOllamaMessages(messages) {
-  return messages.filter((m) => m.role !== 'notice' && m.role !== 'step').map((m) => {
-    const out = { role: m.role, content: m.content };
-    if (m.images) out.images = m.images;
-    if (m.tool_calls) out.tool_calls = m.tool_calls;
-    if (m.tool_name) out.tool_name = m.tool_name;
-    return out;
-  });
-}
-
-function buildAgentPrompt(rootName) {
-  if (!rootName) {
-    return 'You are a local assistant inside VS Code. Answer in the same language the user writes in.';
-  }
-  return [
-    `You are a local coding assistant inside VS Code. You can work with the user's project folder "${rootName}" through tools.`,
-    'Rules:',
-    '- Look at the real files with tools before answering questions about the code. Never guess file contents.',
-    '- All paths are relative to the project root.',
-    '- To change a SMALL file (under about 150 lines) rewrite it completely with write_file (same path, full updated content). Use edit_file only for big files, copying old_string exactly from the file.',
-    '- Make only the changes the user asked for.',
-    '- NEVER paste code or file contents into the chat. Create or change files in the project with write_file or edit_file, then reply with one or two short sentences. The chat is only for talking, questions and corrections.',
-    '- When the user asks for a fix or a change, work on the existing files: read them first, then edit them. Do not start over.',
-    '- Keep the layout simple: put a new standalone page or script in the project root (for example index.html, style.css, script.js) unless the project already has a clear structure. Use the file type the user asked for (an html request means .html, not a framework component).',
-    '- Edits and commands need the user\'s approval. If an action is denied, do not retry it; ask what to do instead.',
-    '- When the task is done, summarise what you did in a few short sentences.',
-    '- Answer in the same language the user writes in.'
-  ].join('\n');
-}
-
-function buildFilesPrompt(rootName) {
-  return [
-    `You are a coding assistant working inside the user's project folder "${rootName}". You cannot run tools, but you can create and change files by writing them in exactly this format:`,
-    '',
-    '<file path="relative/path/to/file.ext">',
-    '...the COMPLETE content of the file...',
-    '</file>',
-    '',
-    'Rules:',
-    '- NEVER show code in any other way. Every piece of code goes into a <file> block and the app saves it into the project. The chat is only for talking.',
-    '- Always give the COMPLETE content of a file, also when you change an existing one (use the same path to replace it). Keep everything the user did not ask to change.',
-    '- Create the files that are missing (for example index.html, style.css, script.js) with short relative paths.',
-    '- Keep the layout simple: new standalone pages go in the project root. Use the file type the user asked for.',
-    '- Outside file blocks write only one to three short sentences: what you did and how to use it.',
-    '- If the user only asks a question or wants to talk, answer in plain text without file blocks.',
-    '- Answer in the same language the user writes in.'
-  ].join('\n');
-}
+const { vscode, fs, path, ICONS, isVisionModel, isCloudModelName, ollamaProcess, WorkspaceTools, normalizeArgs, truncate, skillsLib, workspaceLib, resolveWorkspaceRoot, agentTools, voice, modelState, agentFiles, beforeContent, projectCheck, cloud, diagnostics, CloudClient, cloudLimits, spawn, MAX_TEXT_FILE_CHARS, MAX_TOOL_RESULT_CHARS, MAX_AGENT_STEPS, MAX_DUMP_NUDGES, AUTOPILOT_MAX_STEPS, MAX_NUDGES, MAX_REPEAT_WARNINGS, RETRY_DELAY_MS, MAX_RETRIES, CHARS_PER_TOKEN, trimMessagesToFit, modelSupportsTools, languageNote, isSmallModel, isTinyModel, displayTitle, capDiff, toOllamaMessages, buildCompactAgentPrompt, compactTools, buildAgentPrompt, buildFilesPrompt } = require('./chat/common');
 
 class ChatPanel {
   static currentPanel;
@@ -187,6 +29,7 @@ class ChatPanel {
     this._context = context;
     this._ollamaClient = ollamaClient;
     this._runs = new Map();
+    this._cloud = new CloudClient(context);
     this._recording = null;
     this._voiceTimer = null;
     this._pendingPermissions = new Map();
@@ -219,11 +62,17 @@ class ChatPanel {
     const folderWatcher = vscode.workspace.onDidChangeWorkspaceFolders(() => this._sendModelInfo());
     const editorWatcher = vscode.window.onDidChangeActiveTextEditor(() => this._sendModelInfo());
     const modelWatcher = modelState.onDidChange((change) => this._onModelChanged(change));
+    const limitsWatcher = cloudLimits.onDidChange(({ providerId }) => {
+      const selected = this._context.globalState.get('localAI.selectedModel');
+      const parsed = cloud.parseName(selected);
+      if (parsed && parsed.providerId === providerId) this._post(this._limitsMessage(selected, cloudLimits.get(providerId)));
+    });
     const trustWatcher = vscode.workspace.onDidGrantWorkspaceTrust ? vscode.workspace.onDidGrantWorkspaceTrust(() => this._sendModelInfo()) : { dispose() {} };
     this._panel.onDidDispose(() => {
       folderWatcher.dispose();
       editorWatcher.dispose();
       modelWatcher.dispose();
+      limitsWatcher.dispose();
       trustWatcher.dispose();
       this._stopAll();
       voice.cancelAll();
@@ -251,6 +100,9 @@ class ChatPanel {
       case 'attachFile':
         await this._handleAttachFile(msg.kind);
         break;
+      case 'attachContext':
+        await this._attachContext(msg.kind);
+        break;
       case 'stopGeneration':
         this._stopSession(this._currentSessionId);
         break;
@@ -264,6 +116,12 @@ class ChatPanel {
         break;
       case 'regenerate':
         await this._regenerate();
+        break;
+      case 'revertChanges':
+        await this._revertChanges();
+        break;
+      case 'switchModelAndRetry':
+        await this._switchAndRetry(msg.model);
         break;
       case 'listSessions':
         this._sendSessionsList();
@@ -305,6 +163,11 @@ class ChatPanel {
         await vscode.commands.executeCommand('localAI.selectModel');
         this._sendModelInfo();
         break;
+      case 'openCloudLimits': {
+        const def = cloud.provider(msg.providerId);
+        if (def && def.limitsUrl) vscode.env.openExternal(vscode.Uri.parse(def.limitsUrl));
+        break;
+      }
       case 'manageTrust':
         await vscode.commands.executeCommand('workbench.trust.manage');
         break;
@@ -321,6 +184,7 @@ class ChatPanel {
   }
 
   _post(message) {
+    if (message && (message.type === 'error' || message.type === 'contextTrimmed') && message.text) diagnostics.record(message.type, message.text);
     this._panel.webview.postMessage(message);
   }
 
@@ -365,6 +229,11 @@ class ChatPanel {
       : `Model removed (was ${previous || 'none'}). Pick a model to continue.`;
     if (current && !modelSupportsTools(current) && this._context.globalState.get('localAI.agentEnabled', true)) {
       text += ' (this model cannot use tools: it saves code into your project files but cannot read them on its own)';
+    }
+    if (current && cloud.isCloudModel(current)) {
+      text += ` Cloud model: your messages and the files it reads are sent to ${this._cloudProviderName(current)}.`;
+    } else if (previous && cloud.isCloudModel(previous)) {
+      text += ' Back to a local model: nothing leaves your computer.';
     }
     if (running) text += ' - takes effect from your next message';
     session.history.push({ role: 'notice', content: text });
@@ -551,72 +420,18 @@ class ChatPanel {
       folderLevel: this._folderLevel(),
       modelName,
       supportsVision: isVisionModel(modelName),
+      cloudProvider: modelName ? this._cloudProviderName(modelName) : null,
+      cloudLimits: modelName && cloud.isCloudModel(modelName) ? this._limitsMessage(modelName, cloudLimits.get((cloud.parseName(modelName) || {}).providerId)) : null,
       workspaceName: root ? path.basename(root) : null,
       agentEnabled: this._context.globalState.get('localAI.agentEnabled', true),
       trusted: workspaceLib.isTrusted(),
       permissionMode: this._context.globalState.get('localAI.permissionMode', 'ask'),
       toolsUnsupported: modelName ? this._noToolsModels.has(modelName) || !modelSupportsTools(modelName) : false,
       filesMode: !!(modelName && (this._noToolsModels.has(modelName) || !modelSupportsTools(modelName)) && this._context.globalState.get('localAI.agentEnabled', true) && this._getTools()),
-      voiceReady: voice.status().ready,
+      voiceReady: voice.status().ready && (voice.engine() !== 'groq' || this._groqKeyKnown()),
+      voiceEngine: voice.engine(),
       skills: this._skills().map((sk) => ({ name: sk.name, description: sk.description }))
     });
-  }
-
-  _voiceError(err) {
-    const permissionHint = err.noAudio
-      ? ' Check System Settings > Privacy & Security > Microphone and allow Visual Studio Code (or the app you started it from), then try again.'
-      : '';
-    this._post({ type: 'voiceError', text: `${err.message}${permissionHint}`, setup: !!err.needsSetup });
-  }
-
-  _cancelVoice() {
-    if (this._voiceTimer) clearTimeout(this._voiceTimer);
-    this._voiceTimer = null;
-    if (this._recording) {
-      this._recording.cancel();
-      this._recording = null;
-    }
-    this._post({ type: 'voiceState', state: 'idle' });
-  }
-
-  async _toggleVoice() {
-    if (this._recording) {
-      const recording = this._recording;
-      this._recording = null;
-      if (this._voiceTimer) clearTimeout(this._voiceTimer);
-      this._voiceTimer = null;
-      this._post({ type: 'voiceState', state: 'busy' });
-      try {
-        const wav = await recording.stop();
-        const language = vscode.workspace.getConfiguration('localAI').get('voiceLanguage') || 'auto';
-        const text = await voice.transcribe(wav, language);
-        this._post({ type: 'voiceResult', text });
-      } catch (err) {
-        this._voiceError(err);
-      }
-      this._post({ type: 'voiceState', state: 'idle' });
-      return;
-    }
-
-    const lacking = voice.missing();
-    if (lacking.length) {
-      const err = new Error(`Voice input needs: ${lacking.join(', ')}. It works fully offline afterwards.`);
-      err.needsSetup = true;
-      this._voiceError(err);
-      return;
-    }
-
-    try {
-      this._recording = await voice.startRecording();
-    } catch (err) {
-      this._voiceError(err);
-      return;
-    }
-    this._post({ type: 'voiceState', state: 'recording' });
-    const current = this._recording;
-    this._voiceTimer = setTimeout(() => {
-      if (this._recording === current) this._toggleVoice();
-    }, VOICE_MAX_MS);
   }
 
   _revealFile(tools, relPath) {
@@ -642,74 +457,6 @@ class ChatPanel {
     }
   }
 
-  async _handleAttachFile(kind) {
-    const modelName = this._context.globalState.get('localAI.selectedModel');
-    const supportsVision = isVisionModel(modelName);
-
-    if (kind === 'image' && !supportsVision) {
-      vscode.window.showWarningMessage(
-        `The model "${modelName}" does not support image understanding. Pick a vision model (e.g. gemma3) to attach pictures.`
-      );
-      return;
-    }
-
-    const extensions = kind === 'image'
-      ? ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']
-      : TEXT_FILE_EXTENSIONS;
-
-    const root = this._workspaceRoot();
-    const uris = await vscode.window.showOpenDialog({
-      canSelectMany: true,
-      openLabel: 'Attach',
-      defaultUri: root ? vscode.Uri.file(root) : undefined,
-      filters: {
-        [kind === 'image' ? 'Images' : 'Text files']: extensions
-      }
-    });
-    if (!uris || uris.length === 0) return;
-
-    for (const uri of uris) {
-      const filePath = uri.fsPath;
-      const fileName = path.basename(filePath);
-      const ext = path.extname(filePath).toLowerCase();
-
-      try {
-        if (IMAGE_EXTENSIONS.has(ext)) {
-          const buffer = fs.readFileSync(filePath);
-          const base64 = buffer.toString('base64');
-          const mime = ext === '.jpg' ? 'jpeg' : ext.slice(1);
-          this._post({
-            type: 'fileAttached',
-            kind: 'image',
-            name: fileName,
-            base64,
-            dataUrl: `data:image/${mime};base64,${base64}`
-          });
-        } else {
-          let content = fs.readFileSync(filePath, 'utf8');
-          let truncated = false;
-          if (content.length > MAX_TEXT_FILE_CHARS) {
-            content = content.slice(0, MAX_TEXT_FILE_CHARS);
-            truncated = true;
-          }
-          this._post({
-            type: 'fileAttached',
-            kind: 'text',
-            name: fileName,
-            content,
-            truncated,
-            language: LANGUAGE_BY_EXTENSION[ext] || ''
-          });
-        }
-      } catch (err) {
-        this._post({
-          type: 'error',
-          text: `Could not read the file "${fileName}": ${err.message}`
-        });
-      }
-    }
-  }
-
   seedMessage(text) {
     this._post({ type: 'seed', text });
   }
@@ -726,6 +473,10 @@ class ChatPanel {
       return;
     }
 
+    if (!(await this._ensureCloudConsent(modelName))) {
+      this._post({ type: 'error', text: 'Cloud model not used. Pick a local model, or accept the notice to use the cloud one.' });
+      return;
+    }
     if (session.lastModel && session.lastModel !== modelName && session.history.some((m) => m.role === 'user')) {
       this._addModelNotice(session, session.lastModel, modelName);
     }
@@ -764,8 +515,10 @@ class ChatPanel {
           imageBase64s.push(att.base64);
         }
       });
-      if (imageBase64s.length > 0) {
-        userMessage.images = imageBase64s;
+      if (imageBase64s.length > 0 && !isVisionModel(modelName)) {
+        contentParts.push(`(${imageBase64s.length} picture(s) were attached but the current model cannot see images, so they were not sent.)`);
+      } else if (imageBase64s.length > 0) {
+        userMessage.images = isCloudModelName(modelName) ? imageBase64s.slice(0, 4) : imageBase64s;
       }
     }
 
@@ -845,6 +598,7 @@ class ChatPanel {
       return;
     }
 
+    if (!(await this._ensureCloudConsent(modelName))) return;
     const history = session.history;
     while (history.length > 0 && history[history.length - 1].role !== 'user') {
       history.pop();
@@ -852,11 +606,6 @@ class ChatPanel {
     this._persistSessions(session);
 
     await this._streamAssistantReply(modelName, session);
-  }
-
-  _contextSize() {
-    const configured = vscode.workspace.getConfiguration('localAI').get('contextSize');
-    return Number(configured) >= 2048 ? Number(configured) : DEFAULT_CONTEXT_SIZE;
   }
 
   _permissionMode() {
@@ -890,8 +639,10 @@ class ChatPanel {
       const current = this._filesContext(ctx);
       if (current) late.push(current);
     } else {
-      parts.push(buildAgentPrompt(tools ? path.basename(tools.root) : null));
-      if (tools) late.push(`Folders you may use (paths outside the main folder must be absolute):\n${tools.accessSummary()}\n\nProject structure (first levels; use list_files to go deeper):\n${tools.overview()}`);
+      parts.push(ctx.compact && tools ? buildCompactAgentPrompt(path.basename(tools.root)) : buildAgentPrompt(tools ? path.basename(tools.root) : null));
+      if (tools) late.push(ctx.compact
+        ? `Project structure:\n${tools.overview(30, 1)}`
+        : `Folders you may use (paths outside the main folder must be absolute):\n${tools.accessSummary()}\n\nProject structure (first levels; use list_files to go deeper):\n${tools.overview()}`);
       if (tools && (ctx.session.writtenFiles || []).length) {
         late.push(`Files you created or changed in this chat (continue from them when the user asks for corrections): ${ctx.session.writtenFiles.join(', ')}`);
       }
@@ -899,12 +650,12 @@ class ChatPanel {
         const current = this._filesContext(ctx);
         if (current) late.push(current);
       }
-      if (tools && ctx.canDelegate) {
+      if (tools && ctx.canDelegate && !ctx.compact) {
         parts.push(
           'Helper agents: for a big investigation or a self-contained sub-job, call delegate_task (mode "research" to read, "worker" to change). Give the helper full instructions because it cannot see this chat. Delegate independent jobs in the same turn so they run in parallel. Do small tasks yourself.'
         );
       }
-      if (!autopilot && ctx.toolsEnabled) {
+      if (!autopilot && ctx.toolsEnabled && !ctx.compact) {
         parts.push('If the request is ambiguous or you need a decision you cannot safely guess, call ask_user with one short question and 2-4 options instead of guessing. Do not ask about trivial details.');
       }
       if (autopilot) {
@@ -921,14 +672,14 @@ class ChatPanel {
       }
     }
 
-    if (skills.length > 0) parts.push(skillsLib.skillsPromptSection(skills));
-    if (vscode.workspace.getConfiguration('localAI').get('useClaudeSkills') !== false) {
+    if (skills.length > 0 && !ctx.compact) parts.push(skillsLib.skillsPromptSection(skills));
+    if (vscode.workspace.getConfiguration('localAI').get('useClaudeSkills') !== false && !ctx.compact) {
       const instructions = skillsLib.loadInstructions(this._workspaceRoot());
       if (instructions) parts.push(instructions);
     }
     const userSystemPrompt = this._context.globalState.get('localAI.systemPrompt') || '';
     if (userSystemPrompt) parts.push(userSystemPrompt);
-    if (ctx.autoSkillsText && !ctx.isSub) late.push(ctx.autoSkillsText);
+    if (ctx.autoSkillsText && !ctx.isSub && !ctx.compact) late.push(ctx.autoSkillsText);
     const lang = languageNote(run.lang);
     return (lang && !ctx.isSub ? [lang, ...parts, ...late] : [...parts, ...late]).join('\n\n');
   }
@@ -939,12 +690,14 @@ class ChatPanel {
     if (ctx.isSub && ctx.subMode === 'research') {
       defs = defs.filter((d) => agentTools.READ_ONLY_TOOLS.has(d.function.name));
     }
-    if (ctx.skills.length) defs = [...defs, skillsLib.USE_SKILL_DEFINITION];
+    if (ctx.skills.length && !ctx.compact) defs = [...defs, skillsLib.USE_SKILL_DEFINITION];
     if (!ctx.isSub) {
-      if (ctx.tools && ctx.canDelegate) defs = [...defs, agentTools.DELEGATE_DEFINITION];
+      const wantsAgents = agentTools.mentionsAgents(ctx.run.task);
+      if (ctx.tools && ctx.canDelegate && (!ctx.compact || wantsAgents)) defs = [...defs, agentTools.DELEGATE_DEFINITION];
       if (ctx.autopilot) defs = [...defs, agentTools.PLAN_DEFINITION, agentTools.FINISH_DEFINITION];
-      else defs = [...defs, agentTools.ASK_DEFINITION];
+      else if (!ctx.compact) defs = [...defs, agentTools.ASK_DEFINITION];
     }
+    if (ctx.compact && defs.length) defs = compactTools(defs);
     return defs.length ? defs : undefined;
   }
 
@@ -968,7 +721,7 @@ class ChatPanel {
       });
     }
     const all = system ? [{ role: 'system', content: system }, ...visible] : visible;
-    const { messages, trimmed } = trimMessagesToFit(all, Math.floor(this._contextSize() * CHARS_PER_TOKEN));
+    const { messages, trimmed } = trimMessagesToFit(all, Math.floor(this._contextSize(ctx.modelName) * CHARS_PER_TOKEN));
     return { messages: toOllamaMessages(messages), trimmed };
   }
 
@@ -999,13 +752,20 @@ class ChatPanel {
       plan: [],
       task: '',
       finished: false,
+      changes: new Map(),
       awake: null
     };
+    session.lastChanges = null;
+    this._postFor(session, { type: 'changesSummary', files: [] });
     this._runs.set(session.id, run);
     this._sendSessionsList();
 
     const lastUser = [...session.history].reverse().find((m) => m.role === 'user' && !m.synthetic);
     run.task = lastUser ? displayTitle(lastUser).slice(0, 2000) : '';
+    if (isTinyModel(modelName) && !session.tinyWarned && agentTools.looksLikeTask(run.task)) {
+      session.tinyWarned = true;
+      this._postFor(session, { type: 'notice', text: `${modelName} is a very small model: it often invents files or says it changed something when it did not. For work on your project pick a 7B+ model (or a cloud model) and check the changes it makes.` });
+    }
     const detected = agentTools.detectLanguage(run.task);
     if (detected && detected !== 'Cyrillic') session.lang = detected;
     else if (detected === 'Cyrillic' && !session.lang) session.lang = 'Ukrainian';
@@ -1032,9 +792,10 @@ class ChatPanel {
       isSub: false,
       subMode: null,
       filesMode,
+      compact: cloud.isCloudModel(modelName) && this._cloudBudget(modelName) <= 8000,
       autoSkillsText: autoSkills.text,
       userText: run.task,
-      canDelegate: this._multiAgentEnabled(),
+      canDelegate: this._multiAgentEnabled() && !isTinyModel(modelName),
       toolsEnabled: agentOn && (!!tools || skills.length > 0),
       usage: this._usage(session).main,
       label: '',
@@ -1050,6 +811,10 @@ class ChatPanel {
       if (run.awake) run.awake.kill();
       this._runs.delete(session.id);
       this._sendSessionsList();
+      if (run.changes.size > 0) {
+        session.lastChanges = [...run.changes.values()];
+        ctx.post({ type: 'changesSummary', files: session.lastChanges.map((c) => ({ rel: c.rel, isNew: c.before === null })) });
+      }
       ctx.post({ type: 'replyDone' });
       if (autopilot && !run.stopped) {
         vscode.window.showInformationMessage(
@@ -1066,7 +831,7 @@ class ChatPanel {
 
     for (let attempt = 1; ; attempt++) {
       try {
-        return await this._ollamaClient.chatStream(
+        return await this._clientFor(ctx.modelName).chatStream(
           ctx.modelName,
           messages,
           (token) => {
@@ -1074,15 +839,14 @@ class ChatPanel {
             run.partial += token;
             post({ type: 'assistantToken', text: token });
           },
-          {
+          this._modelOptions(ctx.modelName, {
             onAbortReady: (abortFn) => {
               run.aborts.add(abortFn);
               ctx.currentAbort = abortFn;
             },
-            keepAlive: this._context.globalState.get('localAI.keepAlive') || undefined,
-            numCtx: this._contextSize(),
-            generation: generationLib.options(),
             tools: defs,
+            onNotice: (text) => post({ type: 'contextTrimmed', text }),
+            onLimits: (seen) => this._postFor(ctx.session, this._limitsMessage(ctx.modelName, seen)),
             onThinking: () => ctx.ui && post({ type: 'assistantThinking' }),
             onStats: (stats) => {
               if (ctx.usage) {
@@ -1092,7 +856,7 @@ class ChatPanel {
               }
               if (ctx.ui) post({ type: 'generationStats', stats });
             }
-          }
+          })
         );
       } catch (err) {
         if (run.stopped) return { content: '', toolCalls: [] };
@@ -1161,7 +925,8 @@ class ChatPanel {
         post({
           type: 'error',
           text: isConnRefused ? "Could not reach Ollama - the server isn't running." : `Error: ${err.message}`,
-          showStartServer: isConnRefused
+          showStartServer: isConnRefused,
+          fallbacks: ctx.ui && !ctx.isSub && cloud.isCloudModel(ctx.modelName) && !run.stopped ? this._fallbackModels(ctx.modelName) : undefined
         });
         if (ctx.isSub) throw err;
         return lastText;
@@ -1338,7 +1103,14 @@ class ChatPanel {
       if (isDelegate(calls[i])) {
         let j = i;
         while (j < calls.length && isDelegate(calls[j])) j++;
-        const group = await Promise.all(calls.slice(i, j).map((c) => this._executeToolCall(c, ctx)));
+        let group;
+        if (cloud.isCloudModel(ctx.modelName)) {
+          // Free cloud limits are shared by all requests: helpers run one after another, not in parallel.
+          group = [];
+          for (const c of calls.slice(i, j)) group.push(await this._executeToolCall(c, ctx));
+        } else {
+          group = await Promise.all(calls.slice(i, j).map((c) => this._executeToolCall(c, ctx)));
+        }
         group.forEach((r, k) => {
           results[i + k] = r;
         });
@@ -1462,6 +1234,8 @@ class ChatPanel {
               const abs = tools.resolve(args.path);
               beforeContent.remember(id, { rel: tools.relative(abs), abs, before: beforeText });
               diffMeta = { id, path: tools.relative(abs), hasBefore: beforeText !== null };
+              if (!run.changes.has(abs)) run.changes.set(abs, { abs, rel: tools.relative(abs), before: beforeText });
+              run.changes.get(abs).after = afterText;
             }
           }
           if (name === 'write_file' && !existedBefore) this._revealFile(tools, args.path);
@@ -1528,223 +1302,6 @@ class ChatPanel {
     return items;
   }
 
-  async _chooseHelperModel(subMode, parentModel, session) {
-    if (subMode === 'worker') return parentModel;
-    const configured = String(vscode.workspace.getConfiguration('localAI').get('subagentModel') || '').trim();
-    if (!configured) return parentModel;
-    const installed = await this._installedModels();
-    if (configured === 'auto') {
-      const parentSize = (installed.find((m) => m.name === parentModel) || { size: Infinity }).size;
-      const candidates = installed.filter((m) => m.size > 0.5e9 && m.size < parentSize).sort((a, b) => a.size - b.size);
-      const withTools = candidates.filter((m) => modelSupportsTools(m.name) && !this._noToolsModels.has(m.name));
-      const pick = withTools[0] || candidates[0];
-      return pick ? pick.name : parentModel;
-    }
-    if (installed.some((m) => m.name === configured)) return configured;
-    if (!session.helperWarned) {
-      session.helperWarned = true;
-      this._postFor(session, { type: 'notice', text: `The helper model ${configured} is not installed, so helpers use ${parentModel}.` });
-    }
-    return parentModel;
-  }
-
-  _readerContext(ctx) {
-    const { tools } = ctx;
-    if (!tools) return '';
-    const task = (ctx.history[0] && ctx.history[0].content) || '';
-    let picks = tools.findFilesByName(task, 5);
-    if (picks.length === 0) picks = tools.listSourceFiles(5);
-    let budget = CONTEXT_TOTAL_CHARS;
-    const blocks = [];
-    for (const rel of picks) {
-      if (budget <= 0) break;
-      let data = null;
-      try {
-        data = tools.readForContext(rel, Math.min(CONTEXT_FILE_CHARS, budget));
-      } catch (_) {
-        data = null;
-      }
-      if (!data) continue;
-      budget -= data.text.length;
-      blocks.push(`### ${rel}${data.truncated ? ' (shortened)' : ''}\n\`\`\`\n${data.text}\n\`\`\``);
-    }
-    return `Project structure:\n${tools.overview()}\n\nFiles:\n\n${blocks.join('\n\n') || '(no readable files)'}`;
-  }
-
-  async _runSubAgent(args, parentCtx, callId) {
-    if (parentCtx.isSub) throw new Error('Helper agents cannot start other agents');
-    if (!args.task) throw new Error('"task" is required');
-    const wantsWorker = args.mode === 'worker';
-    if (wantsWorker && parentCtx.mode === 'readonly') {
-      throw new Error('Read-only mode: only research helpers are allowed');
-    }
-    const subMode = wantsWorker ? 'worker' : 'research';
-    const model = await this._chooseHelperModel(subMode, parentCtx.modelName, parentCtx.session);
-    const helperHasTools = modelSupportsTools(model) && !this._noToolsModels.has(model);
-    const reader = !helperHasTools;
-    const title = args.title || 'helper';
-    const entry = {
-      id: callId,
-      title,
-      mode: subMode,
-      model,
-      steps: 0,
-      prompt: 0,
-      output: 0,
-      status: 'running'
-    };
-    this._usage(parentCtx.session).agents.push(entry);
-    this._postUsage(parentCtx.session);
-
-    const subCtx = {
-      ...parentCtx,
-      isSub: true,
-      subMode,
-      canDelegate: false,
-      autopilot: parentCtx.autopilot,
-      modelName: model,
-      toolsEnabled: parentCtx.toolsEnabled && helperHasTools,
-      reader,
-      history: [{ role: 'user', content: String(args.task) }],
-      label: `[${title}] `,
-      ui: false,
-      maxSteps: SUBAGENT_MAX_STEPS[subMode],
-      usage: entry,
-      persist: () => {},
-      onProgress: (text) => {
-        entry.steps++;
-        parentCtx.post({ type: 'toolProgress', id: callId, text: `${entry.steps}. ${text}` });
-        this._postUsage(parentCtx.session);
-      }
-    };
-
-    parentCtx.post({
-      type: 'toolProgress',
-      id: callId,
-      text: `Model: ${model}${model !== parentCtx.modelName ? ' (helper model)' : ''}${reader ? ', reads the files directly without tools' : ''}`
-    });
-
-    let report;
-    try {
-      report = await this._agentLoop(subCtx);
-    } catch (err) {
-      entry.status = 'failed';
-      this._postUsage(parentCtx.session);
-      this._persistSessions(parentCtx.session);
-      throw err;
-    }
-    entry.status = parentCtx.run.stopped ? 'stopped' : 'done';
-    this._postUsage(parentCtx.session);
-    this._persistSessions(parentCtx.session);
-    if (parentCtx.run.stopped) return 'Cancelled by the user.';
-    return truncate(report || '(the helper returned no report)', MAX_SUBAGENT_REPORT_CHARS);
-  }
-
-  async _saveCodeAsFiles(ctx, content) {
-    const { history, post, run } = ctx;
-    const parsed = agentFiles.extractFiles(content);
-    if (parsed.files.length === 0) return null;
-    if (parsed.trailing) {
-      history.push({ role: 'assistant', content: parsed.trailing });
-      ctx.persist();
-    }
-    if (ctx.ui) {
-      post({ type: 'assistantReplace', text: parsed.trailing });
-      post({ type: 'assistantEnd' });
-    }
-    for (const file of parsed.files) {
-      if (run.stopped) break;
-      const result = await this._executeToolCall(
-        { function: { name: 'write_file', arguments: { path: file.path, content: file.content } } },
-        ctx
-      );
-      history.push({
-        role: 'step',
-        name: 'write_file',
-        path: file.path,
-        ok: result.ok,
-        denied: !!result.denied,
-        output: truncate(result.output, 400),
-        diff: capDiff(result.diff)
-      });
-      ctx.persist();
-    }
-    return parsed.trailing || ' ';
-  }
-
-  async _forcedFilesPass(ctx) {
-    const { post, run, tools } = ctx;
-    post({ type: 'notice', text: 'The model did not edit the files by itself, so I am asking it to write the full files directly...' });
-    const langHint = run.lang && run.lang !== 'English' ? ` Write the short text in ${run.lang}.` : '';
-    const system = [
-      buildFilesPrompt(path.basename(tools.root)),
-      `Folders you may use:\n${tools.accessSummary()}\n\nProject structure:\n${tools.overview()}`,
-      this._filesContext(ctx),
-      ctx.autoSkillsText,
-      languageNote(run.lang)
-    ].filter(Boolean).join('\n\n');
-    const messages = [
-      { role: 'system', content: system },
-      { role: 'user', content: `${run.task}\n\n[Reminder: put the complete updated files into <file path="..."> blocks. No explanations of how to do it.${langHint}]` }
-    ];
-    let result;
-    try {
-      result = await this._ollamaClient.chatStream(ctx.modelName, messages, () => {}, {
-        onAbortReady: (abortFn) => run.aborts.add(abortFn),
-        keepAlive: this._context.globalState.get('localAI.keepAlive') || undefined,
-        numCtx: this._contextSize(),
-        generation: generationLib.options()
-      });
-    } catch (_) {
-      return null;
-    }
-    if (process.env.LOCALAI_DEBUG) console.log('[forced pass raw output]', JSON.stringify(result.content.slice(0, 700)), '| len', result.content.length);
-    if (run.stopped) return null;
-    return this._saveCodeAsFiles(ctx, result.content);
-  }
-
-  _rememberFile(session, relPath) {
-    if (!relPath) return;
-    session.writtenFiles = (session.writtenFiles || []).filter((f) => f !== relPath);
-    session.writtenFiles.push(relPath);
-    if (session.writtenFiles.length > 12) session.writtenFiles.shift();
-  }
-
-  _filesContext(ctx) {
-    const { tools, session } = ctx;
-    if (!tools) return '';
-    const picks = [];
-    const add = (rel) => {
-      if (rel && !picks.includes(rel)) picks.push(rel);
-    };
-    (session.writtenFiles || []).slice(-5).reverse().forEach(add);
-    tools.findFilesByName(ctx.userText || '', 3).forEach(add);
-    const editor = vscode.window.activeTextEditor;
-    if (editor && editor.document.uri.scheme === 'file') {
-      try {
-        add(tools.relative(tools.resolve(editor.document.uri.fsPath)));
-      } catch (_) {
-      }
-    }
-
-    let budget = CONTEXT_TOTAL_CHARS;
-    const blocks = [];
-    for (const rel of picks) {
-      if (budget <= 0) break;
-      let data = null;
-      try {
-        data = tools.readForContext(rel, Math.min(CONTEXT_FILE_CHARS, budget));
-      } catch (_) {
-        data = null;
-      }
-      if (!data) continue;
-      budget -= data.text.length;
-      blocks.push(`### ${rel}${data.truncated ? ' (shortened, the file is longer)' : ''}\n\`\`\`\n${data.text}\n\`\`\``);
-    }
-    if (!blocks.length) return '';
-    return `Current contents of the files you are working on (the user may have changed them by hand since you wrote them, so continue from THIS version):\n\n${blocks.join('\n\n')}`;
-  }
-
   _grantsFor(sessionId) {
     if (!this._grantsBySession.has(sessionId)) {
       this._grantsBySession.set(sessionId, new Set());
@@ -1800,6 +1357,11 @@ class ChatPanel {
       this._panel.webview.asWebviewUri(vscode.Uri.joinPath(this._context.extensionUri, 'media', ...parts));
     const icon = (name) => JSON.stringify(ICONS[name] || '').replace(/</g, '\\u003c');
     const iconNames = Object.keys(ICONS);
+    const uiLang = (() => {
+      const setting = vscode.workspace.getConfiguration('localAI').get('language') || 'auto';
+      if (setting === 'en' || setting === 'uk') return setting;
+      return String(vscode.env.language || 'en').toLowerCase().startsWith('uk') ? 'uk' : 'en';
+    })();
     const iconMap = `{${iconNames.map((n) => `${JSON.stringify(n)}:${icon(n)}`).join(',')}}`;
 
     return `<!DOCTYPE html>
@@ -1827,6 +1389,7 @@ class ChatPanel {
         <button class="tool-btn" id="plusBtn" title="Attach files">${ICONS.plus}</button>
         <button class="tool-btn" id="slashBtn" title="Skills (type / in the box)"><span class="slash-glyph">/</span></button>
         <button class="pill" id="modelChip" title="Change model"></button>
+        <button class="pill" id="limitsBtn" title="Free-tier limits of the cloud provider" style="display:none;"></button>
         <button class="pill" id="usageBtn" title="Helper agents and tokens" style="display:none;"></button>
       </div>
       <button class="tool-btn" id="micBtn" title="Voice input">${ICONS.mic}</button>
@@ -1836,12 +1399,17 @@ class ChatPanel {
     </div>
   </div>
 
-<script>window.ICONS = ${iconMap};</script>
+<script>window.ICONS = ${iconMap}; window.__LANG = ${JSON.stringify(uiLang)};</script>
+<script src="${media('i18n.js')}"></script>
 <script src="${media('vendor', 'highlight.min.js')}"></script>
 <script src="${media('chat', 'chat.js')}"></script>
 </body>
 </html>`;
   }
+}
+
+for (const mixin of ['subagents', 'voiceInput', 'attachments', 'cloudSupport', 'filesMode', 'changes']) {
+  Object.assign(ChatPanel.prototype, require(`./chat/${mixin}`));
 }
 
 module.exports = { ChatPanel };

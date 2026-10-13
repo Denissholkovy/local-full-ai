@@ -447,8 +447,8 @@ class WorkspaceTools {
     return { text: lines.join('\n'), truncated };
   }
 
-  overview() {
-    const { text, truncated } = this._tree(this.root, 2, OVERVIEW_ENTRIES);
+  overview(maxEntries, depth) {
+    const { text, truncated } = this._tree(this.root, depth || 2, maxEntries || OVERVIEW_ENTRIES);
     return `${text || '(empty folder)'}${truncated ? '\n... (more files; use list_files to explore)' : ''}`;
   }
 
@@ -598,6 +598,9 @@ class WorkspaceTools {
     const abs = this.resolve(filePath, 'write');
     if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) throw new Error(`"${filePath}" is a folder`);
     const existed = fs.existsSync(abs);
+    if (existed && !content.trim() && fs.readFileSync(abs, 'utf8').trim()) {
+      throw new Error(`Refusing to replace ${this.relative(abs)} with an empty file. Write the complete new content, or use edit_file for a small change.`);
+    }
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content);
     return `${existed ? 'Overwrote' : 'Created'} ${this.relative(abs)} (${content.split('\n').length} lines)`;
