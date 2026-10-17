@@ -61,6 +61,10 @@ function activate(context) {
     vscode.window.registerWebviewViewProvider('localAI.sidebar', sidebarProvider)
   );
 
+  require('./catalog').refresh(context).then((changed) => {
+    if (changed && sidebarProvider._refreshState) sidebarProvider._refreshState().catch(() => {});
+  });
+
   console.log('Local Full AI activated.');
 }
 

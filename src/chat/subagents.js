@@ -3,7 +3,7 @@ const { vscode, truncate, cloud, CONTEXT_FILE_CHARS, CONTEXT_TOTAL_CHARS, SUBAGE
 // Methods mixed into ChatPanel.prototype (see chatPanel.js).
 module.exports = {
   async _chooseHelperModel(subMode, parentModel, session) {
-    if (subMode === 'worker') return parentModel;
+    if (subMode === 'worker' || subMode === 'verify') return parentModel;
     const configured = String(vscode.workspace.getConfiguration('localAI').get('subagentModel') || '').trim();
     if (!configured) return parentModel;
     if (cloud.isCloudModel(configured)) {
@@ -62,7 +62,7 @@ module.exports = {
     if (wantsWorker && parentCtx.mode === 'readonly') {
       throw new Error('Read-only mode: only research helpers are allowed');
     }
-    const subMode = wantsWorker ? 'worker' : 'research';
+    const subMode = wantsWorker ? 'worker' : args.mode === 'verify' ? 'verify' : 'research';
     const model = await this._chooseHelperModel(subMode, parentCtx.modelName, parentCtx.session);
     const helperHasTools = modelSupportsTools(model) && !this._noToolsModels.has(model);
     const reader = !helperHasTools;

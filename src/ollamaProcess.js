@@ -31,7 +31,8 @@ function isManaged() {
 function killGroup(proc) {
   if (!proc || !proc.pid) return;
   try {
-    if (process.platform === 'win32') proc.kill();
+    // On Windows a shell child keeps running unless the whole tree is ended.
+    if (process.platform === 'win32') require('child_process').execFile('taskkill', ['/pid', String(proc.pid), '/T', '/F'], () => {});
     else process.kill(-proc.pid, 'SIGTERM');
   } catch (_) {
     try {

@@ -143,7 +143,8 @@ function globToRegExp(glob) {
 
 function killTree(child) {
   try {
-    if (process.platform === 'win32') child.kill();
+    // On Windows a shell child keeps running unless the whole tree is ended.
+    if (process.platform === 'win32') require('child_process').execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
     else process.kill(-child.pid, 'SIGTERM');
   } catch (_) {
     try {
@@ -274,6 +275,95 @@ class WorkspaceTools {
       return visited < 3000;
     });
     return found.filter((f) => f.size > 0 && f.size < 200000).sort((a, b) => a.size - b.size).slice(0, limit).map((f) => f.rel);
+  }
+
+  // A short map of where things are defined, so the model can open the right file instead of guessing.
+  symbolMap(maxChars = 1500) {
+    const exts = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.go', '.rs', '.java', '.php', '.vue', '.svelte', '.html', '.css']);
+    const patterns = [
+      /(?:^|\n)\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)/g,
+      /(?:^|\n)\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/g,
+      /(?:^|\n)\s*(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g,
+      /(?:^|\n)\s*(?:async\s+)?def\s+([A-Za-z_]\w*)/g,
+      /(?:^|\n)\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/g,
+      /\bid\s*=\s*["']([\w-]+)["']/g
+    ];
+    const lines = [];
+    let used = 0;
+    let visited = 0;
+    this._walk(this.root, (file) => {
+      visited++;
+      if (!exts.has(path.extname(file).toLowerCase())) return visited < 3000;
+      let text;
+      try {
+        if (fs.statSync(file).size > 150000) return true;
+        text = fs.readFileSync(file, 'utf8');
+      } catch (_) {
+        return true;
+      }
+      const names = [];
+      for (const re of patterns) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(text)) && names.length < 14) {
+          const n = re.source.startsWith('\\bid') ? `#${m[1]}` : m[1];
+          if (!names.includes(n)) names.push(n);
+        }
+      }
+      if (!names.length) return true;
+      const line = `${this.relative(file)}: ${names.join(', ')}`;
+      if (used + line.length > maxChars) return false;
+      lines.push(line);
+      used += line.length + 1;
+      return visited < 3000;
+    });
+    return lines.join('\n');
+  }
+
+  memoryPath() {
+    return path.join(this.root, '.localai', 'memory.md');
+  }
+
+  // Notes the agent keeps about this project (conventions, how to run tests, pitfalls). Plain Markdown the user can edit.
+  readMemory(maxChars = 2000) {
+    const parts = [];
+    try {
+      const notes = fs.readFileSync(this.memoryPath(), 'utf8').trim();
+      if (notes) parts.push(`Project notes (.localai/memory.md):\n${notes.slice(-maxChars)}`);
+    } catch (_) {
+    }
+    for (const name of ['AGENTS.md', 'CLAUDE.md', '.cursorrules']) {
+      try {
+        const text = fs.readFileSync(path.join(this.root, name), 'utf8').trim();
+        if (text) {
+          parts.push(`Project instructions (${name}):\n${text.slice(0, maxChars)}`);
+          break;
+        }
+      } catch (_) {
+      }
+    }
+    return parts.join('\n\n');
+  }
+
+  remember(note) {
+    const clean = String(note || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    if (!clean) throw new Error('"note" is required');
+    const file = this.memoryPath();
+    let current = '';
+    try {
+      current = fs.readFileSync(file, 'utf8');
+    } catch (_) {
+      current = '# Project notes for Local Full AI\n\nThe AI adds what it learned about this project here. Edit or delete freely.\n\n';
+    }
+    if (current.toLowerCase().includes(clean.toLowerCase())) return 'Already noted.';
+    let next = `${current.replace(/\s*$/, '\n')}- ${clean}\n`;
+    const header = next.split('\n- ')[0];
+    const items = next.slice(header.length).split('\n- ').map((x) => x.trim()).filter(Boolean).map((x) => x.replace(/^- /, ''));
+    while (items.join('\n').length > 4000) items.shift();
+    next = `${header.replace(/\s*$/, '')}\n\n${items.map((x) => `- ${x}`).join('\n')}\n`;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, next);
+    return `Noted in .localai/memory.md: ${clean}`;
   }
 
   findFilesByName(text, limit = 3) {

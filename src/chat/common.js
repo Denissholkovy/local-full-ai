@@ -19,7 +19,7 @@ const cloud = require('../cloudProviders');
 const diagnostics = require('../diagnostics');
 const { CloudClient } = require('../cloudClient');
 const cloudLimits = require('../cloudLimits');
-const MODEL_CATALOG = require('../models.json');
+const MODEL_CATALOG = require('../catalog').models;
 const { spawn, execFile } = require('child_process');
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
@@ -36,7 +36,7 @@ const CONTEXT_TOTAL_CHARS = 14000;
 const AUTOPILOT_MAX_STEPS = 400;
 const MAX_NUDGES = 6;
 const MAX_REPEAT_WARNINGS = 3;
-const SUBAGENT_MAX_STEPS = { research: 25, worker: 40 };
+const SUBAGENT_MAX_STEPS = { research: 25, worker: 40, verify: 14 };
 const MAX_SUBAGENT_REPORT_CHARS = 6000;
 const RETRY_DELAY_MS = 4000;
 const MAX_RETRIES = 6;

@@ -132,8 +132,25 @@ function run(tools) {
   return issues.slice(0, MAX_ISSUES);
 }
 
+// Names a piece of code defines (functions, classes, arrow-function constants, Python defs).
+function definedNames(text) {
+  const names = new Set();
+  const patterns = [
+    /(?:^|\n)\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)/g,
+    /(?:^|\n)\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/g,
+    /(?:^|\n)\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/g,
+    /(?:^|\n)\s*(?:async\s+)?def\s+([A-Za-z_]\w*)/g
+  ];
+  for (const re of patterns) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(String(text || '')))) names.add(m[1]);
+  }
+  return names;
+}
+
 function format(issues) {
   return issues.length ? issues.map((i) => `- ${i}`).join('\n') : '';
 }
 
-module.exports = { run, format };
+module.exports = { run, format, definedNames };

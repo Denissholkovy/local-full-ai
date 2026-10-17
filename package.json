@@ -207,6 +207,23 @@
           "default": "",
           "description": "Model for research helper agents. Empty = same as the chat, \"auto\" = the smallest installed model, or an exact model name. A small model is fast for simple reading tasks; helpers that edit files always use the chat model."
         },
+        "localAI.verifyChanges": {
+          "type": "string",
+          "enum": ["auto", "always", "off"],
+          "enumDescriptions": [
+            "After the AI changes files: quick checks (syntax, broken links) always, plus a reviewer agent when the model is big enough and the cloud limits allow it",
+            "Always add the reviewer agent, also for cloud models with small free limits",
+            "Do not check the changes"
+          ],
+          "default": "auto",
+          "description": "Check the AI's changes when it finishes a task and let it fix what is broken (up to 2 rounds)."
+        },
+        "localAI.autopilotCommands": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra commands autopilot may run without asking, as prefixes (for example \"docker compose ps\"). By default it only runs commands that test, build, lint or inspect the project."
+        },
         "localAI.language": {
           "type": "string",
           "enum": [

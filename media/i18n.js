@@ -25,7 +25,7 @@
     'Get more models': 'Більше моделей',
     'Install a model by name...': 'Встановити модель за назвою...',
     'Everything in this category is already installed.': 'Усе з цієї категорії вже встановлено.',
-    'Uninstall Ollama completely': 'Повністю видалити Ollama',
+    'How to uninstall Ollama': 'Як видалити Ollama',
     'Code': 'Код',
     'General': 'Загальні',
     'Vision': 'Зображення',
@@ -41,6 +41,18 @@
     'Ollama is installed but not running.': 'Ollama встановлена, але не запущена.',
     'Ollama is not installed.': 'Ollama не встановлена.',
     'It runs the models on this computer. Not needed if you only use cloud models.': 'Вона запускає моделі на цьому комп\'ютері. Не потрібна, якщо ви користуєтесь лише хмарними моделями.',
+    'How should the AI run?': 'Де запускати ШІ?',
+    'On this computer': 'На цьому комп\'ютері',
+    'In the cloud': 'У хмарі',
+    'Private and free, works offline. Needs Ollama and a few GB of disk; speed depends on your computer.': 'Приватно й безкоштовно, працює без інтернету. Потрібна Ollama і кілька ГБ на диску; швидкість залежить від комп\'ютера.',
+    'Faster and stronger, with a free API key (Groq, Gemini and others). Your messages and the files it reads are sent to the provider.': 'Швидше й сильніше, з безкоштовним API-ключем (Groq, Gemini та інші). Ваші повідомлення й файли, які читає модель, надсилаються провайдеру.',
+    'Connect a free provider': 'Підключити безкоштовного провайдера',
+    'Choose a model': 'Обрати модель',
+    'Install Ollama': 'Встановити Ollama',
+    'You can use both and switch any time.': 'Можна користуватися обома й перемикатися будь-коли.',
+    'Show all options': 'Показати всі параметри',
+    'Checked by a reviewer agent: the changes look correct.': 'Перевірено агентом-рецензентом: зміни виглядають правильними.',
+    'Quick check passed: no syntax errors or broken links.': 'Швидка перевірка пройдена: немає синтаксичних помилок і зламаних зв\'язків.',
     // sidebar: settings
     'Both': 'Обидва',
     'Local': 'Локальні',
@@ -86,6 +98,7 @@
     'weak for agent': 'слабка для агента',
     'basic agent': 'базовий агент',
     'no tools': 'без інструментів',
+    'tiny free limit': 'замалий безкоштовний ліміт',
     'vision': 'бачить зображення',
     // chat
     'What are we building?': 'Що будуємо?',
@@ -133,6 +146,8 @@
   };
 
   const RULES = [
+    [/^Install (.+) \((.+)\)$/, (m) => 'Встановити ' + m[1] + ' (' + m[2] + ')'],
+    [/^The check found problems, fixing them \(round (\d) of (\d)\)\.\.\.$/, (m) => 'Перевірка знайшла проблеми, виправляю (раунд ' + m[1] + ' з ' + m[2] + ')...'],
     [/^(Thinking|Writing|Working on your project)( · (\d+)s)?$/, (m) => ({ Thinking: 'Думає', Writing: 'Пише', 'Working on your project': 'Працює над проєктом' }[m[1]]) + (m[3] ? ' · ' + m[3] + 'с' : '')],
     [/^(\d+) files? changed( \((\d+) new\))?$/, (m) => m[1] + ' ' + (m[1] === '1' ? 'файл змінено' : 'файлів змінено') + (m[3] ? ' (' + m[3] + ' нових)' : '')],
     [/^Free-tier limits of (.+)$/, (m) => 'Безкоштовні ліміти ' + m[1]],

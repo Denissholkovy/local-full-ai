@@ -2,6 +2,30 @@
 
 All notable changes to the "Local Full AI" extension are documented here.
 
+## [Unreleased]
+
+### Fixed
+- A fix round could break working code: the reviewer reported a non-problem and the model rewrote a whole file, dropping
+  functions the page still used. Now a rewrite that removes functions still in use is undone right away, a fix round
+  that makes the checks worse is rolled back, and the reviewer only fails real breakage (quoting the wrong line).
+
+### Changed
+- Autopilot runs only test/build/lint/inspect commands (plus `localAI.autopilotCommands`) and never a script it
+  just wrote; very small models (4B and below) no longer start helper agents.
+- The sidebar no longer runs uninstall commands for Ollama; it shows the steps instead.
+- Webviews have a Content-Security-Policy.
+- Windows: command and Ollama processes are stopped with their whole process tree; voice input works with ffmpeg.
+
+### Added
+- **Reviewer agent**: after a task that changed files, quick checks plus (for capable models) a reviewer agent check the
+  work and the AI fixes what is broken, up to two rounds (`localAI.verifyChanges`).
+- **Project memory** (`.localai/memory.md`, plus `AGENTS.md` / `CLAUDE.md`) and a map of where things are defined in
+  every request.
+- **First-run choice** between running on this computer and a free cloud provider.
+- Recommended local models are refreshed daily from the project repository.
+- Undo all changes survives a restart.
+- Cloud models with a tiny free limit are marked "tiny free limit" and offered last as fallbacks.
+
 ## [0.1.0] - 2026-10-13
 
 A large release: the chat now works on your project.

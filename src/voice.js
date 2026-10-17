@@ -4,7 +4,7 @@ const path = require('path');
 const { execFile, spawn } = require('child_process');
 const vscode = require('vscode');
 
-const WHISPER_NAMES = ['whisper-cli', 'whisper-cpp'];
+const WHISPER_NAMES = ['whisper-cli', 'whisper-cpp', 'whisper'];
 const SEARCH_DIRS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/home/linuxbrew/.linuxbrew/bin'];
 const MODEL_DIR = path.join(os.homedir(), '.local-full-ai', 'whisper');
 const DEFAULT_MODEL = path.join(MODEL_DIR, 'ggml-base.bin');
@@ -21,8 +21,10 @@ function findTool(names) {
   const dirs = [...(process.env.PATH || '').split(path.delimiter), ...SEARCH_DIRS].filter(Boolean);
   for (const dir of dirs) {
     for (const name of names) {
-      const candidate = path.join(dir, name);
-      if (fs.existsSync(candidate)) return candidate;
+      for (const variant of process.platform === 'win32' ? [`${name}.exe`, name] : [name]) {
+        const candidate = path.join(dir, variant);
+        if (fs.existsSync(candidate)) return candidate;
+      }
     }
   }
   return null;
@@ -40,8 +42,29 @@ function findModel() {
   return fs.existsSync(DEFAULT_MODEL) ? DEFAULT_MODEL : null;
 }
 
+let windowsMic;
+
+// ffmpeg on Windows needs the exact name of the microphone ("Microphone (Realtek Audio)").
+function windowsMicrophone(ffmpeg) {
+  if (windowsMic !== undefined) return windowsMic;
+  windowsMic = null;
+  try {
+    const out = require('child_process').spawnSync(ffmpeg, ['-hide_banner', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'], { encoding: 'utf8', timeout: 5000 });
+    const text = `${out.stderr || ''}${out.stdout || ''}`;
+    const m = text.match(/"([^"]+)"\s*\(audio\)/) || text.match(/DirectShow audio devices[\s\S]*?"([^"]+)"/);
+    if (m) windowsMic = m[1];
+  } catch (_) {
+    windowsMic = null;
+  }
+  return windowsMic;
+}
+
 function recorderSpec(file) {
-  if (process.platform === 'win32') return null;
+  if (process.platform === 'win32') {
+    const ffmpeg = findTool(['ffmpeg']);
+    const mic = ffmpeg ? windowsMicrophone(ffmpeg) : null;
+    return mic ? { bin: ffmpeg, args: ['-loglevel', 'error', '-f', 'dshow', '-i', `audio=${mic}`, '-ar', '16000', '-ac', '1', '-y', file] } : null;
+  }
   const rec = findTool(['rec']);
   if (rec) return { bin: rec, args: ['-q', '-r', '16000', '-c', '1', '-b', '16', file] };
   const sox = findTool(['sox']);
@@ -79,7 +102,10 @@ function status() {
 }
 
 function setupCommand() {
-  if (process.platform === 'win32') return null;
+  if (process.platform === 'win32') {
+    const missingFfmpeg = !findTool(['ffmpeg']);
+    return missingFfmpeg ? 'winget install --id Gyan.FFmpeg -e' : null;
+  }
   const packages = [];
   if (!findWhisper()) packages.push('whisper-cpp');
   if (!recorderSpec('x.wav')) packages.push('sox');
@@ -112,7 +138,7 @@ function startRecording(specOverride) {
       return reject(new Error('No audio recorder found.'));
     }
 
-    const proc = spawn(spec.bin, spec.args, { stdio: ['ignore', 'ignore', 'pipe'], detached: process.platform !== 'win32' });
+    const proc = spawn(spec.bin, spec.args, { stdio: [process.platform === 'win32' ? 'pipe' : 'ignore', 'ignore', 'pipe'], detached: process.platform !== 'win32' });
     let stderr = '';
     let exited = false;
     let exitCode = null;
@@ -137,7 +163,9 @@ function startRecording(specOverride) {
         recordings.delete(handle);
         if (!exited) {
           try {
-            proc.kill('SIGINT');
+            // ffmpeg on Windows does not get SIGINT; "q" on stdin makes it finish the file properly.
+            if (process.platform === 'win32' && proc.stdin) proc.stdin.write('q');
+            else proc.kill('SIGINT');
           } catch (_) {
           }
           await Promise.race([closed, new Promise((r) => setTimeout(r, STOP_TIMEOUT_MS))]);

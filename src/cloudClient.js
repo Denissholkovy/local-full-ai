@@ -85,6 +85,7 @@ class CloudClient {
   constructor(context) {
     this._context = context;
     capabilities.setCloudCaps(context.globalState.get('localAI.cloudCaps', {}));
+    limits.loadModelCaps(context.globalState.get('localAI.cloudModelCaps', {}));
   }
 
   async _key(providerId) {
@@ -264,7 +265,10 @@ class CloudClient {
           if (hardTooLarge) {
             const m = peek.match(/Limit (\d+).*?Requested (\d+)/is);
             const pname = provider(parsed.providerId).name;
-            if (m) limits.setModelCap(parsed.providerId, parsed.modelId, Number(m[1]));
+            if (m) {
+              limits.setModelCap(parsed.providerId, parsed.modelId, Number(m[1]));
+              Promise.resolve(this._context.globalState.update('localAI.cloudModelCaps', limits.allModelCaps())).catch(() => {});
+            }
             if (m && Number(m[1]) < 3000) {
               throw new Error(`${pname} allows "${parsed.modelId}" only ${m[1]} tokens per minute on the free tier, and this request needs ${m[2]}. That is too small for working on a project: pick another model (for example a larger one in "Change models").`);
             }

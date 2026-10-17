@@ -22,10 +22,28 @@ Cloud models are strictly opt-in and clearly marked.
   on a small fast model. A badge shows how many agents ran and the tokens used.
 - It can **ask you** a clarifying question in a small dialog above the input.
 
+**Checks its own work**
+- When the AI finishes a task that changed files, quick checks run (syntax of the changed files, HTML ids, `onclick`
+  handlers, missing scripts). With a model that is big enough, a **reviewer agent** then reads the changes, runs the
+  project's tests when there are any, and answers PASS or FAIL. If something is wrong, the AI fixes it, up to two rounds
+  (`localAI.verifyChanges`).
+- **Undo all changes** restores every file the last request touched, also after VS Code was restarted.
+
+**Learns your project**
+- The AI keeps short notes about your project in `.localai/memory.md` (how to run tests, conventions, pitfalls) and reads
+  them in every new chat. It is plain Markdown: edit or delete it as you like. `AGENTS.md` or `CLAUDE.md` in the project
+  root are read too.
+- Every request includes a small map of where functions, classes and element ids are defined, so small models open the
+  right file instead of guessing.
+- This is not fine-tuning: training a model on your code needs a strong GPU and hours per change, and rarely helps more
+  than giving the model the right files and notes.
+
 **Safe by design**
 - **Folder access levels** per folder: Full, Ask first, Read only, No access (hidden). Add extra folders, pick the
   working folder. The file tools never read or write outside the folders you allow. Commands run in the working
-  folder and always need your approval (Autopilot uses a blocklist instead).
+  folder and always need your approval. Autopilot (which cannot ask) only runs commands that test, build, lint or inspect
+  the project (`npm test`, `npm run build`, `pytest`, `git status` ...), never a script it just wrote itself; add your own
+  with `localAI.autopilotCommands`. Note that running tests still executes your project's code.
 - Respects VS Code **Workspace Trust**: in Restricted Mode the AI can only chat.
 - When VS Code closes, everything the extension started is stopped (an Ollama installed as a system service keeps
   running, but its models are unloaded from memory).
@@ -142,7 +160,7 @@ Most options are in the sidebar under **Settings**. The full list:
 |---|---|---|---|
 | Chat, models, project tools | yes | yes | yes |
 | Automatic Ollama install | Homebrew | install script | use the official installer |
-| Voice input | yes | `arecord` / `sox` / `ffmpeg` | not yet |
+| Voice input | yes | `arecord` / `sox` / `ffmpeg` | with `ffmpeg` (untested; Groq engine recommended) |
 | Keep-awake during Autopilot | yes | no | no |
 | Hardware fit | Apple Silicon, CPU | NVIDIA, CPU | NVIDIA, CPU |
 
@@ -152,6 +170,9 @@ Most options are in the sidebar under **Settings**. The full list:
   *"No file was changed"* when a reply did not change anything. For real debugging use a larger model.
 - The fit estimate is approximate and the context memory is a rough guess.
 - Autopilot stops if VS Code is closed; it does not resume after a restart.
+- Windows and Linux are much less tested than macOS.
+- The reviewer agent is the same model as the chat: a weak model can miss its own mistakes. Very small models (4B and
+  below) only get the quick checks and do not start helper agents.
 - Voice transcription quality depends on the whisper model and your microphone.
 
 ## Troubleshooting

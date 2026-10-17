@@ -1,4 +1,4 @@
-const MODEL_CATALOG = require('./models.json');
+const MODEL_CATALOG = require('./catalog').models;
 
 const VISION_MODEL_HINTS = [
   'llava',
@@ -16,9 +16,7 @@ const VISION_MODEL_HINTS = [
   'gemma3'
 ];
 
-const CATALOG_VISION_NAMES = new Set(
-  MODEL_CATALOG.filter((m) => m.category === 'vision').map((m) => m.name)
-);
+const isCatalogVision = (name) => MODEL_CATALOG.some((m) => m.category === 'vision' && m.name === name);
 
 const CLOUD_VISION_HINTS = [
   'gemini', 'gpt-4o', 'gpt-4.1', 'gpt-4-turbo', 'gpt-5', 'llama-4', 'llama-3.2-11b', 'llama-3.2-90b', 'pixtral',
@@ -46,7 +44,7 @@ function isVisionModel(modelName) {
     const lowerCloud = String(modelName).toLowerCase();
     return CLOUD_VISION_HINTS.some((hint) => lowerCloud.includes(hint));
   }
-  if (CATALOG_VISION_NAMES.has(modelName)) return true;
+  if (isCatalogVision(modelName)) return true;
 
   const lower = modelName.toLowerCase();
   return VISION_MODEL_HINTS.some((hint) => lower.includes(hint));

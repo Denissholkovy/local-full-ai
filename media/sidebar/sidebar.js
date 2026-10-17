@@ -20,6 +20,7 @@
   let providersOpen = false;
   let othersOpen = false;
   let moreOpen = false;
+  let welcomeDismissed = false;
   const pulls = {};
 
   function send(type, extra) {
@@ -59,6 +60,7 @@
   }
 
   function cloudTierTag(m) {
+    if (m.tier === 'tiny') return '<span class="tag warn" title="The provider allows only ' + m.tokenCap + ' tokens per minute for this model: too little for project work.">tiny free limit</span>';
     if (m.tier === 'notools') return '<span class="tag warn" title="This model cannot call tools.">no tools</span>';
     if (m.tier === 'weak') return '<span class="tag warn" title="Small or fast model: weaker at agent tasks.">weak for agent</span>';
     if (m.tier === 'best') return '<span class="tag ok" title="Strong at code and tools.">agent-ready</span>';
@@ -165,6 +167,8 @@
     bind('[data-act="cloudRemoveKey"]', (el) => send('cloudRemoveKey', { providerId: el.getAttribute('data-provider') }));
     bind('[data-act="cloudCheckLimits"]', (el) => send('cloudCheckLimits', { providerId: el.getAttribute('data-provider') }));
     bind('[data-act="cloudOpenPage"]', (el, e) => { e.preventDefault(); send('cloudOpenPage', { providerId: el.getAttribute('data-provider'), which: el.getAttribute('data-which') }); });
+    bind('[data-act="skipWelcome"]', () => { welcomeDismissed = true; render(); });
+    bind('[data-act="welcomeLocal"]', () => { welcomeDismissed = true; mainTab = 'local'; moreOpen = true; render(); });
     bind('[data-act="toggleOthersOpen"]', () => { othersOpen = !othersOpen; render(); });
     bind('[data-act="toggleMoreOpen"]', () => { moreOpen = !moreOpen; render(); });
     bind('[data-act="toggleProvidersOpen"]', () => { providersOpen = !providersOpen; render(); });
@@ -408,6 +412,41 @@
     return { cloud: false, label: name, where: 'this computer' };
   }
 
+  function isFirstRun() {
+    const noLocal = state.view !== 'ready' || !state.installed || state.installed.length === 0;
+    const noCloud = !state.cloud || state.cloud.models.length === 0;
+    return !state.selectedModel && noLocal && noCloud;
+  }
+
+  function bestLocalPick() {
+    if (!state.hardware || !state.hardware.fits || !state.catalog) return null;
+    return state.catalog.find((m) => m.category === 'code' && state.hardware.fits[m.name] && state.hardware.fits[m.name].best) || null;
+  }
+
+  // First start: one clear choice instead of the whole sidebar.
+  function welcomeHtml() {
+    const best = bestLocalPick();
+    let local;
+    if (state.view !== 'ready') {
+      local = state.installed
+        ? '<button class="btn" data-act="start">' + icon('play') + ' Start Ollama</button>'
+        : '<button class="btn" data-act="autoInstall">' + icon('bolt') + ' Install Ollama</button>';
+    } else if (best) {
+      local = '<button class="btn" data-act="install" data-model="' + esc(best.name) + '">' + icon('download') + ' Install ' + esc(best.label) + ' (' + formatSize(best.sizeGB) + ')</button>';
+    } else {
+      local = '<button class="btn" data-act="welcomeLocal">' + icon('download') + ' Choose a model</button>';
+    }
+    return '<div class="welcome">' +
+      '<h2>How should the AI run?</h2>' +
+      '<div class="welcome-choice local"><div class="welcome-title">On this computer</div>' +
+        '<div class="welcome-text">Private and free, works offline. Needs Ollama and a few GB of disk; speed depends on your computer.</div>' + local + '</div>' +
+      '<div class="welcome-choice cloud"><div class="welcome-title">In the cloud</div>' +
+        '<div class="welcome-text">Faster and stronger, with a free API key (Groq, Gemini and others). Your messages and the files it reads are sent to the provider.</div>' +
+        '<button class="btn" data-act="cloudConnect">' + icon('plus') + ' Connect a free provider</button></div>' +
+      '<div class="welcome-note">You can use both and switch any time.</div>' +
+    '</div>';
+  }
+
   function bannerHtml() {
     const m = describeModel(state.selectedModel);
     if (!m) {
@@ -452,7 +491,7 @@
     let html = '<div class="panel-note local">Models that run on this computer through Ollama. Private and free, no internet needed.</div>';
     if (state.view !== 'ready') {
       html += localOffHtml();
-      html += '<div class="footer"><button class="btn danger" data-act="uninstall">' + icon('trash') + ' Uninstall Ollama completely</button></div>';
+      html += '<div class="footer"><button class="btn link" data-act="uninstall">' + icon('trash') + ' How to uninstall Ollama</button></div>';
       return html;
     }
     const installedNames = new Set(state.installed.map((m) => m.name));
@@ -481,7 +520,7 @@
       if (available.length === 0) html += '<div class="empty">Everything in this category is already installed.</div>';
       else available.forEach((m) => { html += libraryRow(m); });
       html += '<button class="btn link" data-act="manual">' + icon('pencil') + ' Install a model by name...</button>';
-      html += '<div class="footer"><button class="btn danger" data-act="uninstall">' + icon('trash') + ' Uninstall Ollama completely</button></div>';
+      html += '<div class="footer"><button class="btn link" data-act="uninstall">' + icon('trash') + ' How to uninstall Ollama</button></div>';
     }
     return html;
   }
@@ -594,6 +633,14 @@
       return;
     }
     const tab = currentTab();
+    if (isFirstRun() && !welcomeDismissed) {
+      const pulling = Object.keys(pulls).some((n) => !pulls[n].done);
+      if (!pulling) {
+        content.innerHTML = welcomeHtml() + '<button class="btn link" data-act="skipWelcome">Show all options</button>';
+        bindAll();
+        return;
+      }
+    }
     let html = bannerHtml();
     html += settingsHtml();
     html += '<div class="divider"></div>';

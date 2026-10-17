@@ -56,6 +56,21 @@ const DELEGATE_DEFINITION = {
   }
 };
 
+const REMEMBER_DEFINITION = {
+  type: 'function',
+  function: {
+    name: 'remember',
+    description: 'Save one short, lasting fact about this project for future chats: a convention, where something lives, how to run or test it, or a mistake to avoid. Not for the current task details.',
+    parameters: {
+      type: 'object',
+      properties: {
+        note: { type: 'string', description: 'One sentence, e.g. "Tests run with npm test (jest); UI strings live in src/i18n.js"' }
+      },
+      required: ['note']
+    }
+  }
+};
+
 const ASK_DEFINITION = {
   type: 'function',
   function: {
@@ -99,6 +114,30 @@ const DANGEROUS_COMMANDS = [
 function dangerousCommand(command) {
   const text = String(command || '');
   return DANGEROUS_COMMANDS.some((re) => re.test(text));
+}
+
+// Autopilot runs commands without asking, so it only runs commands that check or build the project.
+// Everything else is refused (the agent mentions it in its summary) instead of trusting a blocklist.
+const AUTOPILOT_SAFE = [
+  /^(npm|pnpm|yarn|bun)\s+(test|run(\s+[\w:.-]+)?|t|ci|install|i|exec\s+(tsc|eslint|prettier|jest|vitest|mocha))(\s+[^;&|<>`$]*)?$/,
+  /^npx\s+(--yes\s+)?(tsc|eslint|prettier|jest|vitest|mocha|playwright\s+test|htmlhint|stylelint)(\s+[^;&|<>`$]*)?$/,
+  /^node\s+(--check\s+)?[\w./-]+\.(m?js|cjs)(\s+[^;&|<>`$]*)?$/,
+  /^(python3?|py)\s+(-m\s+(pytest|unittest|py_compile|compileall|mypy|ruff|flake8)|[\w./-]+\.py)(\s+[^;&|<>`$]*)?$/,
+  /^(pytest|mypy|ruff|flake8|tsc|eslint|jest|vitest)(\s+[^;&|<>`$]*)?$/,
+  /^(go\s+(test|build|vet|run)|cargo\s+(test|build|check|clippy|run)|dotnet\s+(test|build)|mvn\s+(-q\s+)?(test|compile|verify)|gradle\s+(test|build)|\.\/gradlew\s+(test|build)|make(\s+[\w.-]+)?)(\s+[^;&|<>`$]*)?$/,
+  /^(ls|pwd|cat|head|tail|wc|grep|rg|find|tree|echo|which|diff)(\s+[^;&|<>`$]*)?$/,
+  /^git\s+(status|diff|log|show|branch)(\s+[^;&|<>`$]*)?$/,
+  /^mkdir\s+(-p\s+)?[\w./-]+$/
+];
+
+function autopilotCommandAllowed(command, extraPrefixes) {
+  const text = String(command || '').trim();
+  if (!text || /`|\$\(|\$\{|>|<|\bsudo\b/.test(text) || dangerousCommand(text)) return false;
+  const parts = text.split(/\s*(?:&&|\|\||;|\|)\s*/).filter(Boolean);
+  const extra = (extraPrefixes || []).map((p) => String(p).trim()).filter(Boolean);
+  return parts.every((part) =>
+    AUTOPILOT_SAFE.some((re) => re.test(part)) || extra.some((prefix) => part === prefix || part.startsWith(prefix + ' '))
+  );
 }
 
 function formatPlan(items) {
@@ -297,6 +336,8 @@ function looksLikeToolAttempt(content) {
 }
 
 module.exports = {
+  REMEMBER_DEFINITION,
+  autopilotCommandAllowed,
   PLAN_DEFINITION,
   FINISH_DEFINITION,
   DELEGATE_DEFINITION,

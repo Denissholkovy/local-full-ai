@@ -1,10 +1,52 @@
-const { vscode, fs } = require('./common');
+const { vscode, fs, path } = require('./common');
 
 // Methods mixed into ChatPanel.prototype (see chatPanel.js).
 module.exports = {
+  _undoDir() {
+    const base = this._context.globalStorageUri ? this._context.globalStorageUri.fsPath : require('os').tmpdir();
+    return path.join(base, 'undo');
+  },
+
+  // File contents before the request are kept on disk (not in the chat state), so Undo works after a restart.
+  _saveUndo(session, changes) {
+    const total = changes.reduce((n, c) => n + (c.before ? c.before.length : 0) + (c.after ? c.after.length : 0), 0);
+    if (!changes.length || total > 8 * 1024 * 1024) return null;
+    try {
+      const dir = this._undoDir();
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, `${session.id}.json`);
+      fs.writeFileSync(file, JSON.stringify(changes));
+      return { file, files: changes.map((c) => ({ rel: c.rel, isNew: c.before === null })) };
+    } catch (_) {
+      return null;
+    }
+  },
+
+  _loadUndo(session) {
+    const saved = session.lastChanges;
+    if (!saved) return null;
+    if (Array.isArray(saved)) return saved;
+    try {
+      return JSON.parse(fs.readFileSync(saved.file, 'utf8'));
+    } catch (_) {
+      return null;
+    }
+  },
+
+  _dropUndo(session) {
+    const saved = session.lastChanges;
+    if (saved && saved.file) {
+      try {
+        fs.unlinkSync(saved.file);
+      } catch (_) {
+      }
+    }
+    session.lastChanges = null;
+  },
+
   async _revertChanges() {
     const session = this._currentSession();
-    const changes = session.lastChanges;
+    const changes = this._loadUndo(session);
     if (!changes || !changes.length || this._runs.has(session.id)) return;
     const touched = changes.filter((c) => {
       try {
@@ -32,7 +74,7 @@ module.exports = {
         failed.push(`${c.rel}: ${err.message}`);
       }
     }
-    session.lastChanges = failed.length ? changes : null;
+    if (!failed.length) this._dropUndo(session);
     const text = failed.length ? `Could not undo everything: ${failed.join('; ')}` : `Undone: ${changes.length} file${changes.length > 1 ? 's' : ''} restored to how they were before the request.`;
     session.history.push({ role: 'notice', content: text });
     this._persistSessions(session);

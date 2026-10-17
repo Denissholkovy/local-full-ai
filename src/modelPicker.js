@@ -1,6 +1,6 @@
 const vscode = require('vscode');
 const modelState = require('./modelState');
-const MODEL_CATALOG = require('./models.json');
+const MODEL_CATALOG = require('./catalog').models;
 
 const RECOMMENDED_MODELS = MODEL_CATALOG;
 

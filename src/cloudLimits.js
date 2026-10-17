@@ -117,6 +117,14 @@ function setModelCap(providerId, modelId, tokens) {
   if (tokens > 0) modelCaps.set(`${providerId}:${modelId}`, tokens);
 }
 
+function loadModelCaps(obj) {
+  Object.entries(obj || {}).forEach(([k, v]) => { if (v > 0) modelCaps.set(k, v); });
+}
+
+function allModelCaps() {
+  return Object.fromEntries(modelCaps);
+}
+
 function getModelCap(providerId, modelId) {
   return modelCaps.get(`${providerId}:${modelId}`) || 0;
 }
@@ -141,4 +149,4 @@ function waitFor(providerId, tokens) {
   return wait;
 }
 
-module.exports = { setModelCap, getModelCap, waitFor, resetSeconds, parseHeaders, record, recordItems, get, onDidChange: emitter.event, formatReset };
+module.exports = { setModelCap, getModelCap, loadModelCaps, allModelCaps, waitFor, resetSeconds, parseHeaders, record, recordItems, get, onDidChange: emitter.event, formatReset };

@@ -57,7 +57,8 @@ module.exports = {
   _fallbackModels(failed) {
     const failedProvider = (cloud.parseName(failed) || {}).providerId;
     const all = this._context.globalState.get('localAI.cloudModels', []).filter((m) => m.name !== failed);
-    const rank = (m) => (m.providerId !== failedProvider ? 0 : 1) + (cloud.rank(m.modelId) === 'weak' ? 2 : 0);
+    const tiny = (m) => { const cap = cloudLimits.getModelCap(m.providerId, m.modelId); return cap && cap < 3000; };
+    const rank = (m) => (m.providerId !== failedProvider ? 0 : 1) + (cloud.rank(m.modelId) === 'weak' ? 2 : 0) + (tiny(m) ? 4 : 0);
     return all
       .slice()
       .sort((a, b) => rank(a) - rank(b))

@@ -263,6 +263,7 @@ class ChatPanel {
     const run = this._runs.get(session.id);
     this._post({ type: 'loadHistory', history: session.history, running: !!run });
     this._post({ type: 'usage', usage: this._usage(session) });
+    this._post({ type: 'changesSummary', files: !run && session.lastChanges && session.lastChanges.files ? session.lastChanges.files : [] });
     if (!run) return;
     if (run.currentTool) {
       this._post(run.currentTool);
@@ -307,6 +308,7 @@ class ChatPanel {
     const idx = this._sessions.findIndex((s) => s.id === id);
     if (idx === -1) return;
     this._stopSession(id);
+    this._dropUndo(this._sessions[idx]);
     this._sessions.splice(idx, 1);
     this._grantsBySession.delete(id);
 
@@ -608,6 +610,29 @@ class ChatPanel {
     await this._streamAssistantReply(modelName, session);
   }
 
+  // A file the agent itself wrote in this run must not be executed unattended (it could do anything).
+  _runsFreshCode(run, command) {
+    const text = String(command || '');
+    const changed = [...((run && run.changes) || new Map()).values()].map((c) => c.rel);
+    if (changed.some((rel) => rel && text.includes(rel.split('/').pop()) && /^(node|python3?|py|bash|sh|zsh|ruby|perl|php|deno|bun)\b/.test(text.trim()))) return true;
+    if (changed.includes('package.json') && /^(npm|pnpm|yarn|bun)\s+(run|test|t|exec|install|i|ci)\b/.test(text.trim())) return true;
+    if (changed.some((rel) => /(^|\/)(Makefile|build\.gradle|pom\.xml|Cargo\.toml|setup\.py|pyproject\.toml)$/.test(rel))) return true;
+    return false;
+  }
+
+  // A rewrite of an existing file must not drop functions that other code still calls.
+  _removedStillUsed(tools, relPath, beforeText) {
+    if (beforeText === null || !/\.(m?js|cjs|jsx|ts|tsx|py)$/i.test(String(relPath || ''))) return null;
+    const afterText = tools.snapshot(relPath);
+    if (afterText === null) return null;
+    const after = projectCheck.definedNames(afterText);
+    const lost = [...projectCheck.definedNames(beforeText)].filter((n) => !after.has(n));
+    if (!lost.length) return null;
+    const problems = projectCheck.run(tools).join('\n');
+    const used = lost.filter((n) => new RegExp(`\\b${n.replace(/\$/g, '\\$')}\\b`).test(problems));
+    return used.length ? used.map((n) => `${n}()`) : null;
+  }
+
   _permissionMode() {
     return this._context.globalState.get('localAI.permissionMode', 'ask');
   }
@@ -628,11 +653,17 @@ class ChatPanel {
       if (context) parts.push(context);
     } else if (ctx.isSub) {
       parts.push(
-        ctx.subMode === 'worker'
+        ctx.subMode === 'verify'
+          ? 'You are a reviewer agent. Another agent just changed the project to complete a task. Check its work: read the changed files (and the files they use) and run the existing tests or checks when the project has them. Do not change files. Report FAIL only for real breakage of what the user asked for: an error, a function or element that is called but does not exist, a missing file, or the requested behaviour clearly not working. Do NOT fail for style, naming, missing extras, possible improvements or features the user did not ask for. For every problem quote the exact line that is wrong. Finish with one line "VERDICT: PASS", or "VERDICT: FAIL" followed by a short numbered list (file, quoted line, what is wrong, how to fix). When unsure, PASS. Never ask questions.'
+          : ctx.subMode === 'worker'
           ? 'You are a worker agent helping a lead agent. Do exactly the assigned task inside the project, verify it (run tests or the build when they exist), then reply with a short report: what you changed, which files, and anything left open. Never ask questions; make reasonable choices.'
           : 'You are a research agent helping a lead agent. Use only the read tools to investigate the project. Reply with a compact report: findings, exact file paths and line numbers, and a clear answer to the assigned question. Never ask questions.'
       );
       if (tools) late.push(`Project folder: "${path.basename(tools.root)}". Paths are relative to its root.\n\nProject structure:\n${tools.overview()}`);
+      if (tools) {
+        const memory = tools.readMemory(1200);
+        if (memory) late.push(memory);
+      }
     } else if (ctx.filesMode) {
       parts.push(buildFilesPrompt(path.basename(tools.root)));
       late.push(`Folders you may use:\n${tools.accessSummary()}\n\nProject structure:\n${tools.overview()}`);
@@ -647,8 +678,17 @@ class ChatPanel {
         late.push(`Files you created or changed in this chat (continue from them when the user asks for corrections): ${ctx.session.writtenFiles.join(', ')}`);
       }
       if (tools) {
+        const memory = tools.readMemory(ctx.compact ? 700 : 2000);
+        if (memory) late.push(memory);
+        if (!ctx.compact) {
+          const map = tools.symbolMap(1400);
+          if (map) late.push(`Where things are defined (file: functions, classes, element ids):\n${map}`);
+        }
         const current = this._filesContext(ctx);
         if (current) late.push(current);
+      }
+      if (tools && ctx.toolsEnabled && !ctx.compact && ctx.mode !== 'readonly') {
+        parts.push('Project memory: when you learn something lasting about this project (how to run or test it, a convention, where something lives, a mistake to avoid), call remember with one short sentence. Do not store task details.');
       }
       if (tools && ctx.canDelegate && !ctx.compact) {
         parts.push(
@@ -690,10 +730,14 @@ class ChatPanel {
     if (ctx.isSub && ctx.subMode === 'research') {
       defs = defs.filter((d) => agentTools.READ_ONLY_TOOLS.has(d.function.name));
     }
+    if (ctx.isSub && ctx.subMode === 'verify') {
+      defs = defs.filter((d) => agentTools.READ_ONLY_TOOLS.has(d.function.name) || d.function.name === 'run_command');
+    }
     if (ctx.skills.length && !ctx.compact) defs = [...defs, skillsLib.USE_SKILL_DEFINITION];
     if (!ctx.isSub) {
       const wantsAgents = agentTools.mentionsAgents(ctx.run.task);
       if (ctx.tools && ctx.canDelegate && (!ctx.compact || wantsAgents)) defs = [...defs, agentTools.DELEGATE_DEFINITION];
+      if (ctx.tools && !ctx.compact && ctx.mode !== 'readonly') defs = [...defs, agentTools.REMEMBER_DEFINITION];
       if (ctx.autopilot) defs = [...defs, agentTools.PLAN_DEFINITION, agentTools.FINISH_DEFINITION];
       else if (!ctx.compact) defs = [...defs, agentTools.ASK_DEFINITION];
     }
@@ -755,7 +799,7 @@ class ChatPanel {
       changes: new Map(),
       awake: null
     };
-    session.lastChanges = null;
+    this._dropUndo(session);
     this._postFor(session, { type: 'changesSummary', files: [] });
     this._runs.set(session.id, run);
     this._sendSessionsList();
@@ -807,13 +851,15 @@ class ChatPanel {
 
     try {
       await this._agentLoop(ctx);
+      if (!run.stopped && ctx.tools && run.changes.size) await this._verifyAndFix(ctx);
     } finally {
       if (run.awake) run.awake.kill();
       this._runs.delete(session.id);
       this._sendSessionsList();
       if (run.changes.size > 0) {
-        session.lastChanges = [...run.changes.values()];
-        ctx.post({ type: 'changesSummary', files: session.lastChanges.map((c) => ({ rel: c.rel, isNew: c.before === null })) });
+        session.lastChanges = this._saveUndo(session, [...run.changes.values()]);
+        this._persistSessions(session);
+        if (session.lastChanges) ctx.post({ type: 'changesSummary', files: session.lastChanges.files });
       }
       ctx.post({ type: 'replyDone' });
       if (autopilot && !run.stopped) {
@@ -1128,7 +1174,7 @@ class ChatPanel {
     const name = (call.function && call.function.name) || 'unknown';
     const args = normalizeArgs(call.function && call.function.arguments);
     const id = `t${++this._toolCounter}`;
-    const noPathTools = ['use_skill', 'delegate_task', 'update_plan', 'finish_task', 'ask_user'];
+    const noPathTools = ['use_skill', 'delegate_task', 'update_plan', 'finish_task', 'ask_user', 'remember'];
     const permission = noPathTools.includes(name) || !tools
       ? null
       : WorkspaceTools.permissionFor(name);
@@ -1137,6 +1183,7 @@ class ChatPanel {
       use_skill: `Skill ${args.name || ''}`,
       delegate_task: `Agent: ${args.title || 'helper'}`,
       update_plan: 'Plan',
+      remember: `Remember: ${String(args.note || '').slice(0, 80)}`,
       finish_task: 'Finish task',
       ask_user: `Question: ${args.question || ''}`
     }[name] || (tools ? tools.label(name, args) : name);
@@ -1172,10 +1219,18 @@ class ChatPanel {
       denied = true;
       ok = false;
       output = 'Permission denied: the user set read-only mode. You can only read and search. Tell the user what you would change instead.';
-    } else if (permission === 'command' && ctx.mode === 'autopilot' && agentTools.dangerousCommand(args.command)) {
+    } else if (
+      permission === 'command' &&
+      ctx.mode === 'autopilot' &&
+      !agentTools.autopilotCommandAllowed(args.command, vscode.workspace.getConfiguration('localAI').get('autopilotCommands') || [])
+    ) {
       denied = true;
       ok = false;
-      output = 'Blocked: this command is not allowed in autopilot (sudo, git push, destructive deletes, publishing). Find another way, or leave it out and mention it in the summary.';
+      output = 'Blocked: autopilot only runs commands that test, build, lint or inspect the project (for example npm test, npm run build, node --check file.js, pytest, git status), without redirects or $(...). Use the file tools instead, or leave this command out and list it in your summary so the user can run it.';
+    } else if (permission === 'command' && ctx.mode === 'autopilot' && this._runsFreshCode(run, args.command)) {
+      denied = true;
+      ok = false;
+      output = 'Blocked: in autopilot you may not directly run a script or build file you created or changed in this task. Run the project\'s existing tests or checks instead, or list the command in your summary so the user can run it.';
     } else if (
       permission &&
       ctx.mode !== 'autopilot' &&
@@ -1199,6 +1254,10 @@ class ChatPanel {
           const skill = skillsLib.findSkill(skills, args.name);
           if (!skill) throw new Error(`No skill named "${args.name}". Available: ${skills.map((sk) => sk.name).join(', ')}`);
           output = skillsLib.readSkill(skill, args.file);
+        } else if (name === 'remember') {
+          if (!tools) throw new Error('No project folder is open');
+          if (ctx.mode === 'readonly') throw new Error('Read-only mode: nothing can be saved');
+          output = tools.remember(args.note);
         } else if (name === 'update_plan') {
           run.plan = agentTools.parsePlanItems(args.items);
           output = agentTools.formatPlan(run.plan);
@@ -1227,6 +1286,11 @@ class ChatPanel {
           const isEdit = (name === 'write_file' || name === 'edit_file') && args.path;
           const beforeText = isEdit ? tools.snapshot(args.path) : null;
           output = await tools.run(name, args);
+          const broke = isEdit ? this._removedStillUsed(tools, args.path, beforeText) : null;
+          if (broke) {
+            fs.writeFileSync(tools.resolve(args.path), beforeText);
+            throw new Error(`This change was undone: it removed ${broke.join(', ')}, which the project still uses. Keep the existing code. For a small change use edit_file; with write_file give the COMPLETE file including the existing functions.`);
+          }
           if (isEdit) {
             const afterText = tools.snapshot(args.path);
             if (afterText !== null) {
@@ -1364,10 +1428,19 @@ class ChatPanel {
     })();
     const iconMap = `{${iconNames.map((n) => `${JSON.stringify(n)}:${icon(n)}`).join(',')}}`;
 
+    const nonce = require('crypto').randomBytes(16).toString('base64');
+    const csp = [
+      "default-src 'none'",
+      `img-src ${this._panel.webview.cspSource} data: https:`,
+      `style-src ${this._panel.webview.cspSource} 'unsafe-inline'`,
+      `font-src ${this._panel.webview.cspSource}`,
+      `script-src 'nonce-${nonce}'`
+    ].join('; ');
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="${csp}" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <link rel="stylesheet" href="${media('chat', 'chat.css')}" />
 </head>
@@ -1399,16 +1472,16 @@ class ChatPanel {
     </div>
   </div>
 
-<script>window.ICONS = ${iconMap}; window.__LANG = ${JSON.stringify(uiLang)};</script>
-<script src="${media('i18n.js')}"></script>
-<script src="${media('vendor', 'highlight.min.js')}"></script>
-<script src="${media('chat', 'chat.js')}"></script>
+<script nonce="${nonce}">window.ICONS = ${iconMap}; window.__LANG = ${JSON.stringify(uiLang)};</script>
+<script nonce="${nonce}" src="${media('i18n.js')}"></script>
+<script nonce="${nonce}" src="${media('vendor', 'highlight.min.js')}"></script>
+<script nonce="${nonce}" src="${media('chat', 'chat.js')}"></script>
 </body>
 </html>`;
   }
 }
 
-for (const mixin of ['subagents', 'voiceInput', 'attachments', 'cloudSupport', 'filesMode', 'changes']) {
+for (const mixin of ['subagents', 'voiceInput', 'attachments', 'cloudSupport', 'filesMode', 'changes', 'verify']) {
   Object.assign(ChatPanel.prototype, require(`./chat/${mixin}`));
 }
 

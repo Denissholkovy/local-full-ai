@@ -335,3 +335,11 @@ h3 .count {
 h3.collapsible { cursor: pointer; user-select: none; }
 h3.collapsible:hover { opacity: 0.9; }
 h3.collapsible .chev { display: inline-flex; align-items: center; gap: 4px; }
+
+.welcome h2 { font-size: 14px; margin: 6px 0 12px; }
+.welcome-choice { border: 1px solid var(--line); border-left-width: 4px; border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; background: rgba(127,127,127,0.06); }
+.welcome-choice.local { border-left-color: var(--vscode-testing-iconPassed, #4caf50); }
+.welcome-choice.cloud { border-left-color: var(--vscode-textLink-foreground, #3794ff); }
+.welcome-title { font-weight: 600; margin-bottom: 4px; }
+.welcome-text { font-size: 11.5px; opacity: 0.8; line-height: 1.45; margin-bottom: 8px; }
+.welcome-note { font-size: 11px; opacity: 0.6; text-align: center; margin: 4px 0 8px; }
