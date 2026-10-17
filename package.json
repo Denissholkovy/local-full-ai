@@ -3,7 +3,7 @@
   "displayName": "Local Full AI",
   "publisher": "Denys-Shovkovyi",
   "description": "A private AI coding assistant for VS Code, powered by local Ollama models, with optional free cloud models when local ones are too weak: chat, edit your project with approval, autopilot, helper agents, voice input and model management.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "MIT",
   "icon": "media/icon.png",
   "keywords": [
@@ -209,7 +209,11 @@
         },
         "localAI.verifyChanges": {
           "type": "string",
-          "enum": ["auto", "always", "off"],
+          "enum": [
+            "auto",
+            "always",
+            "off"
+          ],
           "enumDescriptions": [
             "After the AI changes files: quick checks (syntax, broken links) always, plus a reviewer agent when the model is big enough and the cloud limits allow it",
             "Always add the reviewer agent, also for cloud models with small free limits",
@@ -220,7 +224,9 @@
         },
         "localAI.autopilotCommands": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "description": "Extra commands autopilot may run without asking, as prefixes (for example \"docker compose ps\"). By default it only runs commands that test, build, lint or inspect the project."
         },
