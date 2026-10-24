@@ -33,17 +33,7 @@ module.exports = {
       return;
     }
     if (kind === 'problems') {
-      const severity = ['Error', 'Warning'];
-      const lines = [];
-      for (const [uri, list] of vscode.languages.getDiagnostics()) {
-        if (!uri || uri.scheme !== 'file') continue;
-        const rel = path.relative(root, uri.fsPath);
-        if (rel.startsWith('..') || rel.includes('node_modules')) continue;
-        for (const d of list) {
-          if (d.severity > 1) continue;
-          lines.push(`${rel}:${d.range.start.line + 1}:${d.range.start.character + 1} ${severity[d.severity]}: ${d.message}${d.source ? ` (${d.source})` : ''}`);
-        }
-      }
+      const lines = require('../problems').collect(root, { limit: 151 });
       if (!lines.length) {
         vscode.window.showInformationMessage('The Problems panel has no errors or warnings.');
         return;

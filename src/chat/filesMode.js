@@ -1,4 +1,4 @@
-const { vscode, path, truncate, agentTools, agentFiles, CONTEXT_FILE_CHARS, CONTEXT_TOTAL_CHARS, languageNote, capDiff, buildFilesPrompt } = require('./common');
+const { vscode, fs, path, truncate, agentTools, agentFiles, CONTEXT_FILE_CHARS, CONTEXT_TOTAL_CHARS, languageNote, capDiff, buildFilesPrompt } = require('./common');
 
 // Methods mixed into ChatPanel.prototype (see chatPanel.js).
 module.exports = {
@@ -6,6 +6,7 @@ module.exports = {
     const { history, post, run } = ctx;
     const parsed = agentFiles.extractFiles(content);
     if (parsed.files.length === 0) return null;
+    run.saveErrors = [];
     if (parsed.trailing) {
       history.push({ role: 'assistant', content: parsed.trailing });
       ctx.persist();
@@ -30,6 +31,7 @@ module.exports = {
         output: truncate(result.output, 400),
         diff: capDiff(result.diff)
       });
+      if (!result.ok && !result.denied) run.saveErrors.push(`${file.path}: ${String(result.output).replace(/^Error:\s*/, '')}`);
       ctx.persist();
     }
     return parsed.trailing || ' ';
@@ -88,6 +90,28 @@ module.exports = {
       } catch (_) {
       }
     }
+
+    // A page is only half of the feature: its scripts and styles belong with it.
+    picks.slice().forEach((rel) => {
+      if (!/\.html?$/i.test(rel)) return;
+      let html = '';
+      try {
+        html = fs.readFileSync(tools.resolve(rel), 'utf8');
+      } catch (_) {
+        return;
+      }
+      const re = /<script[^>]*\bsrc\s*=\s*["']([^"']+)["']|<link[^>]*\bhref\s*=\s*["']([^"']+\.css)["']/gi;
+      let m;
+      while ((m = re.exec(html)) !== null) {
+        const ref = (m[1] || m[2]).split(/[?#]/)[0];
+        if (/^(https?:)?\/\/|^data:/i.test(ref)) continue;
+        try {
+          const abs = path.resolve(path.dirname(tools.resolve(rel)), ref);
+          if (fs.existsSync(abs)) add(tools.relative(abs));
+        } catch (_) {
+        }
+      }
+    });
 
     let snapshot = false;
     if (picks.length === 0 && !ctx.isSub && (agentTools.looksLikeTask(ctx.userText) || agentTools.looksLikeFollowUpEdit(ctx.userText, true))) {

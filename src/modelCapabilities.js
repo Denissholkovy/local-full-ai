@@ -36,8 +36,52 @@ function cloudCap(modelName, key) {
   return entry && typeof entry[key] === 'boolean' ? entry[key] : null;
 }
 
+// What Ollama reported for installed models: { "qwen3:8b": { capabilities: [...], contextLength } }
+let localCaps = {};
+
+function setLocalCaps(map) {
+  localCaps = map && typeof map === 'object' ? map : {};
+}
+
+// true / false when Ollama told us, null when unknown (old Ollama or not checked yet).
+function localCap(modelName, capability) {
+  const entry = localCaps[modelName];
+  return entry && Array.isArray(entry.capabilities) ? entry.capabilities.includes(capability) : null;
+}
+
+// true when the model can be told not to think (think:false); false for models that always think.
+function canSwitchThinking(modelName) {
+  const entry = localCaps[modelName];
+  return !!(entry && entry.thinkingSwitch);
+}
+
+function localContextLength(modelName) {
+  const entry = localCaps[modelName];
+  return (entry && entry.contextLength) || 0;
+}
+
+// Asks Ollama once per model version what it can do; `save` stores the updated map.
+async function learnLocal(client, modelName, save) {
+  if (!modelName || isCloudModelName(modelName)) return;
+  try {
+    const installed = (await client.listLocalModels()).find((m) => m.name === modelName);
+    if (!installed) return;
+    const known = localCaps[modelName];
+    if (known && known.digest === installed.digest && known.capsVersion === 2) return;
+    const info = await client.showModel(modelName);
+    if (!info) return;
+    localCaps = { ...localCaps, [modelName]: { ...info, digest: installed.digest } };
+    if (save) await save(localCaps);
+  } catch (_) {
+  }
+}
+
 function isVisionModel(modelName) {
   if (!modelName) return false;
+  if (!String(modelName).startsWith('cloud:')) {
+    const known = localCap(modelName, 'vision');
+    if (known !== null) return known;
+  }
   if (String(modelName).startsWith('cloud:')) {
     const known = cloudCap(modelName, 'vision');
     if (known !== null) return known;
@@ -54,4 +98,4 @@ function isCloudModelName(modelName) {
   return String(modelName || '').startsWith('cloud:');
 }
 
-module.exports = { setCloudCaps, cloudCap, getCloudCaps: () => cloudCaps, isVisionModel, isCloudModelName, VISION_MODEL_HINTS };
+module.exports = { setCloudCaps, cloudCap, getCloudCaps: () => cloudCaps, setLocalCaps, getLocalCaps: () => localCaps, learnLocal, localCap, localContextLength, canSwitchThinking, isVisionModel, isCloudModelName, VISION_MODEL_HINTS };

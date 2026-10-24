@@ -4,8 +4,8 @@ const { vscode, modelState, cloud, isVisionModel, cloudCap, cloudLimits } = requ
 module.exports = {
   async _cloudState() {
     const providers = [];
-    for (const p of cloud.PROVIDERS) {
-      const hasKey = !!(await this._context.secrets.get(`localAI.key.${p.id}`));
+    for (const p of cloud.allProviders()) {
+      const hasKey = p.server || !!(await this._context.secrets.get(`localAI.key.${p.id}`));
       const seen = cloudLimits.get(p.id);
       providers.push({
         id: p.id,
@@ -14,6 +14,9 @@ module.exports = {
         hasKeyPage: !!p.keyUrl,
         hasLimits: !!p.limitsUrl,
         canCheck: p.id === 'openrouter',
+        paid: !!p.paid,
+        server: !!p.server,
+        local: !!p.local,
         note: p.note,
         dataNote: p.dataNote,
         limits: seen ? { at: seen.at, model: seen.model, items: seen.items, retryAfter: seen.retryAfter } : null
@@ -35,13 +38,14 @@ module.exports = {
   async _cloudConnect() {
     const items = (await this._cloudState()).providers.map((p) => {
       const def = cloud.provider(p.id);
-      return { label: `${p.hasKey ? '$(check) ' : ''}${p.name}`, description: p.hasKey ? 'key saved' : def.keyUrl ? 'free key available' : '', detail: p.note, id: p.id };
+      return { label: `${p.hasKey ? '$(check) ' : ''}${p.name}`, description: p.server ? (p.local ? 'on this computer' : 'your server') : p.hasKey ? 'key saved' : def.paid ? 'paid' : def.keyUrl ? 'free key available' : '', detail: p.note, id: p.id };
     });
     const picked = await vscode.window.showQuickPick(items, {
       title: 'Connect a cloud provider',
       placeHolder: 'Local models too weak? Pick a provider with a free tier. Your prompts are sent to it.'
     });
     if (!picked) return;
+    if (picked.id === 'custom') return this._cloudAddServer();
     const state = (await this._cloudState()).providers.find((p) => p.id === picked.id);
     if (state && state.hasKey) await this._cloudPickModels(picked.id);
     else await this._cloudSetKey(picked.id, true);
@@ -50,6 +54,11 @@ module.exports = {
   async _cloudSetKey(providerId, offerKeyPage) {
     const def = cloud.provider(providerId);
     if (!def) return;
+    if (providerId === 'custom' && !(await this._context.secrets.get('localAI.key.custom'))) return this._cloudAddServer();
+    if (def.server) {
+      if (await this._askServerKey(def)) await this._refreshState();
+      return;
+    }
     if (providerId === 'custom') {
       const url = await vscode.window.showInputBox({
         prompt: 'Address of the OpenAI-compatible API (the part before /chat/completions)',
@@ -61,7 +70,7 @@ module.exports = {
       await this._context.globalState.update('localAI.cloudCustomUrl', url.replace(/\/+$/, ''));
     } else if (offerKeyPage && def.keyUrl) {
       const choice = await vscode.window.showInformationMessage(
-        `${def.name}: create a free API key on their site, then paste it here.`,
+        def.paid ? `${def.name} is a paid service: create an API key on their site (you pay per use), then paste it here.` : `${def.name}: create a free API key on their site, then paste it here.`,
         'Open the key page',
         'I already have a key'
       );
@@ -78,6 +87,58 @@ module.exports = {
     await this._context.secrets.store(`localAI.key.${providerId}`, key.trim());
     await this._refreshState();
     await this._cloudPickModels(providerId);
+  },
+
+  // A server with an OpenAI-compatible API (LM Studio, llama.cpp, vLLM, a paid API...). The key is optional.
+  async _cloudAddServer() {
+    const preset = await vscode.window.showQuickPick(
+      [
+        ...cloud.SERVER_PRESETS.map((p) => ({ label: p.name, description: p.baseUrl, detail: 'Runs on this computer, no key needed', preset: p })),
+        { label: 'Other address...', detail: 'Any OpenAI-compatible API, on this computer, in your network or in the cloud' }
+      ],
+      { title: 'Add an OpenAI-compatible server', placeHolder: 'Start the server first, then pick it here' }
+    );
+    if (!preset) return;
+    const url = await vscode.window.showInputBox({
+      prompt: 'Address of the API (the part before /chat/completions)',
+      placeHolder: 'http://localhost:1234/v1',
+      value: preset.preset ? preset.preset.baseUrl : '',
+      ignoreFocusOut: true,
+      validateInput: (v) => (/^https?:\/\/\S+$/.test(v.trim()) ? null : 'Enter a full address starting with http:// or https://')
+    });
+    if (!url) return;
+    const baseUrl = url.trim().replace(/\/+$/, '').replace(/\/chat\/completions$/, '');
+    const name = await vscode.window.showInputBox({
+      prompt: 'Name shown in the model list',
+      value: preset.preset ? preset.preset.name : new URL(baseUrl).hostname,
+      ignoreFocusOut: true,
+      validateInput: (v) => (v.trim() ? null : 'Enter a name')
+    });
+    if (!name) return;
+    const server = { id: cloud.newServerId(name), name: name.trim(), baseUrl };
+    const list = [...cloud.getServers(), server];
+    cloud.setServers(list);
+    await this._context.globalState.update('localAI.customServers', list);
+    if (!cloud.isLoopback(baseUrl) && !(await this._askServerKey(cloud.provider(server.id)))) {
+      await this._context.globalState.update('localAI.customServers', list.filter((s) => s.id !== server.id));
+      cloud.setServers(list.filter((s) => s.id !== server.id));
+      return;
+    }
+    await this._refreshState();
+    await this._cloudPickModels(server.id);
+  },
+
+  // Returns false when the user cancelled; an empty answer removes the key.
+  async _askServerKey(def) {
+    const key = await vscode.window.showInputBox({
+      prompt: `API key for ${def.name} (leave empty if the server needs none). It is stored in VS Code's secret storage.`,
+      password: true,
+      ignoreFocusOut: true
+    });
+    if (key === undefined) return false;
+    if (key.trim()) await this._context.secrets.store(`localAI.key.${def.id}`, key.trim());
+    else await this._context.secrets.delete(`localAI.key.${def.id}`);
+    return true;
   },
 
   async _cloudPickModels(providerId) {
@@ -165,9 +226,14 @@ module.exports = {
 
   async _cloudRemoveKey(providerId) {
     const def = cloud.provider(providerId);
-    const confirm = await vscode.window.showWarningMessage(`Remove the ${def.name} key and its models from this extension?`, { modal: true }, 'Remove');
+    const confirm = await vscode.window.showWarningMessage(`Remove ${def.server ? def.name : `the ${def.name} key`} and its models from this extension?`, { modal: true }, 'Remove');
     if (confirm !== 'Remove') return;
     await this._context.secrets.delete(`localAI.key.${providerId}`);
+    if (def.server) {
+      const list = cloud.getServers().filter((s) => s.id !== providerId);
+      cloud.setServers(list);
+      await this._context.globalState.update('localAI.customServers', list);
+    }
     const current = this._context.globalState.get('localAI.cloudModels', []);
     await this._context.globalState.update('localAI.cloudModels', current.filter((m) => m.providerId !== providerId));
     const selected = this._context.globalState.get('localAI.selectedModel');
@@ -183,22 +249,4 @@ module.exports = {
     await this._refreshState();
   },
 
-  async _chooseCloudContext() {
-    const config = vscode.workspace.getConfiguration('localAI');
-    const current = Number(config.get('cloudContextSize')) || 12000;
-    const sizes = [4000, 6000, 8000, 12000, 16000, 32000];
-    const notes = {
-      4000: 'safest for very small free limits',
-      6000: 'fits tiny per-minute limits (compact mode)',
-      8000: 'compact mode up to here',
-      12000: 'default',
-      16000: 'longer chats, needs a bigger free limit',
-      32000: 'only for providers with large limits'
-    };
-    const picked = await vscode.window.showQuickPick(
-      sizes.map((n) => ({ label: `${n === current ? '$(check) ' : ''}${Math.round(n / 1000)}K tokens`, description: notes[n], value: n })),
-      { title: 'Cloud context size (how much is sent to a cloud model)', placeHolder: 'Free tiers allow only a few thousand tokens per minute. The extension also lowers this automatically from the limit the provider reports.' }
-    );
-    if (picked) await config.update('cloudContextSize', picked.value, vscode.ConfigurationTarget.Global);
-  },
 };

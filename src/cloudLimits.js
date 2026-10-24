@@ -92,12 +92,17 @@ function parseHeaders(headers) {
   return { items, retryAfter: retryAfter ? formatReset(retryAfter) : '' };
 }
 
+// These providers count limits separately for every model, so one model's numbers say nothing about another.
+const PER_MODEL = new Set(['groq', 'gemini', 'cerebras']);
+
 function record(providerId, modelId, parsed) {
-  const previous = store.get(providerId);
+  const modelKey = `${providerId}:${modelId}`;
+  const previous = store.get(modelKey);
   if (parsed.items.length === 0 && previous && previous.items.length && Date.now() - previous.at < 10 * 60 * 1000) {
     return previous;
   }
   const entry = { at: Date.now(), model: modelId, items: parsed.items, retryAfter: parsed.retryAfter };
+  store.set(modelKey, entry);
   store.set(providerId, entry);
   emitter.fire({ providerId });
   return entry;
@@ -129,13 +134,17 @@ function getModelCap(providerId, modelId) {
   return modelCaps.get(`${providerId}:${modelId}`) || 0;
 }
 
-function get(providerId) {
-  return store.get(providerId) || null;
+// Without a model: the latest numbers of the provider. With a model: only numbers that apply to that model.
+function get(providerId, modelId) {
+  if (!modelId) return store.get(providerId) || null;
+  const own = store.get(`${providerId}:${modelId}`);
+  if (own) return own;
+  return PER_MODEL.has(providerId) ? null : store.get(providerId) || null;
 }
 
 // How long to wait before a request of about `tokens` tokens fits into the per-minute budget (0 = go now).
-function waitFor(providerId, tokens) {
-  const seen = store.get(providerId);
+function waitFor(providerId, tokens, modelId) {
+  const seen = get(providerId, modelId);
   if (!seen) return 0;
   const age = (Date.now() - seen.at) / 1000;
   let wait = 0;

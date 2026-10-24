@@ -20,6 +20,8 @@ jobs:
             echo "Tag ${GITHUB_REF_NAME} does not match package.json version $VERSION"
             exit 1
           fi
+      - name: Test
+        run: npm test
       - name: Package
         run: npx --yes @vscode/vsce package --no-dependencies
       - name: Publish to the Visual Studio Marketplace

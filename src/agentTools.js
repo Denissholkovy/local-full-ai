@@ -43,18 +43,42 @@ const DELEGATE_DEFINITION = {
   type: 'function',
   function: {
     name: 'delegate_task',
-    description: 'Hand a self-contained job to a helper agent with a fresh context and get back its written report. Use mode "research" to investigate code (read-only) and "worker" to make changes. Several delegate_task calls in one turn run in parallel. Give the helper everything it needs: it cannot see this conversation.',
+    description: 'Hand a big, self-contained job to a helper agent with a fresh context. Only worth it for work across many files or several independent areas that can run in parallel; do small jobs yourself, a helper is much slower. The helper cannot see this chat, so write a complete brief. Mode "research" reads only, "worker" may change files.',
     parameters: {
       type: 'object',
       properties: {
-        title: { type: 'string', description: 'Short name of the job, e.g. "Find auth code"' },
-        task: { type: 'string', description: 'Full instructions and the expected shape of the report' },
+        title: { type: 'string', description: 'Short name of the job, e.g. "Map the payment flow"' },
+        goal: { type: 'string', description: 'What the helper must find out or do, and why, in a few sentences' },
+        files: { type: 'array', items: { type: 'string' }, description: 'Files and folders you already know are relevant (relative paths), so the helper does not search for them' },
+        known: { type: 'string', description: 'What you already know or ruled out, so the helper does not repeat it' },
+        deliverable: { type: 'string', description: 'Exactly what the report must contain, e.g. "list of functions with file:line and a one-line purpose each"' },
         mode: { type: 'string', enum: ['research', 'worker'], description: 'research = read only, worker = may edit and run commands' }
       },
-      required: ['title', 'task']
+      required: ['title', 'goal', 'deliverable']
     }
   }
 };
+
+const MIN_GOAL_CHARS = 25;
+
+// A helper starts from nothing: a thin brief makes it search the whole project again.
+function briefProblem(args) {
+  const goal = String(args.goal || args.task || '').trim();
+  if (goal.length < MIN_GOAL_CHARS) return 'The brief is too thin: write the goal in a few full sentences (what to find or do, and why).';
+  if (!String(args.deliverable || '').trim() && !args.task) return 'Say in "deliverable" exactly what the report must contain.';
+  return null;
+}
+
+function formatBrief(args) {
+  const files = (Array.isArray(args.files) ? args.files : String(args.files || '').split(/[,\n]/)).map((f) => String(f).trim()).filter(Boolean);
+  return [
+    `Goal: ${String(args.goal || args.task || '').trim()}`,
+    files.length ? `Start with these files: ${files.join(', ')}` : '',
+    String(args.known || '').trim() ? `Already known (do not repeat it): ${String(args.known).trim()}` : '',
+    String(args.deliverable || '').trim() ? `Your report must contain: ${String(args.deliverable).trim()}` : '',
+    'Stay inside this goal, be quick, and stop as soon as you can answer.'
+  ].filter(Boolean).join('\n\n');
+}
 
 const REMEMBER_DEFINITION = {
   type: 'function',
@@ -91,7 +115,7 @@ const ASK_DEFINITION = {
   }
 };
 
-const READ_ONLY_TOOLS = new Set(['list_files', 'read_file', 'search_text', 'use_skill']);
+const READ_ONLY_TOOLS = new Set(['list_files', 'read_file', 'search_text', 'semantic_search', 'get_problems', 'use_skill']);
 
 const DANGEROUS_COMMANDS = [
   /\bsudo\b/,
@@ -323,8 +347,25 @@ function asksForFileContent(content) {
   return /(provide|share|send|show|paste|надайте|надішліть|покажіть|вставте|пришлите|предоставьте|покажите).{0,60}(content|contents|file|code|вміст|файл|код|содержим)/i.test(tail);
 }
 
+function normalizeText(text) {
+  return String(text || '').replace(/<think>[\s\S]*?<\/think>/g, '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
+// Small models often write their previous answer again after a tool result: true when `next` repeats `previous`.
+function repeatsText(next, previous) {
+  const a = normalizeText(next);
+  const b = normalizeText(previous);
+  if (!a || !b || Math.min(a.length, b.length) < 20) return false;
+  if (a === b) return true;
+  const [short, long] = a.length < b.length ? [a, b] : [b, a];
+  return long.includes(short) && short.length / long.length >= 0.85;
+}
+
+// Only an explicit request for helper agents counts, not "parallel", "user agent" or "агентство".
 function mentionsAgents(text) {
-  return /(агент|помічник|помощник|helper|sub-?agent|delegate|делегу|паралельн|параллельн|parallel)/i.test(String(text || ''));
+  const t = String(text || '');
+  if (/(?<![\p{L}])(агент(и|ів|ам|ами|ах|а|ом)?|помічник(и|ів|ам|ами|а|ом)?|помощник(и|ов|ам|ами|а|ом)?|субагент\p{L}*|делегу\p{L}*)(?![\p{L}])/iu.test(t)) return true;
+  return /\b(sub-?agents?|helper agents?|helpers|delegate)\b/i.test(t) || /\bagents\b/i.test(t.replace(/\buser[- ]agents?\b/gi, ''));
 }
 
 function endsWithQuestion(content) {
@@ -336,6 +377,9 @@ function looksLikeToolAttempt(content) {
 }
 
 module.exports = {
+  repeatsText,
+  briefProblem,
+  formatBrief,
   REMEMBER_DEFINITION,
   autopilotCommandAllowed,
   PLAN_DEFINITION,

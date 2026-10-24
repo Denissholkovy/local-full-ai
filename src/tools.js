@@ -16,6 +16,7 @@ const MAX_SEARCH_MATCHES = 60;
 const MAX_SEARCH_FILE_BYTES = 1024 * 1024;
 const MAX_COMMAND_OUTPUT = 8000;
 const COMMAND_TIMEOUT_MS = 60000;
+const SOURCE_EXTENSIONS = new Set(['.html', '.htm', '.css', '.js', '.mjs', '.ts', '.tsx', '.jsx', '.py', '.json', '.md', '.go', '.rs', '.java', '.php', '.vue', '.svelte']);
 
 const TOOL_DEFINITIONS = [
   {
@@ -116,6 +117,8 @@ const TOOL_DEFINITIONS = [
 const PERMISSION_BY_TOOL = {
   edit_file: 'edit',
   write_file: 'edit',
+  generate_image: 'edit',
+  web_fetch: 'web',
   run_command: 'command'
 };
 
@@ -139,6 +142,47 @@ function globToRegExp(glob) {
   }
   const matchesAnyDepth = !glob.includes('/');
   return new RegExp(matchesAnyDepth ? `(^|/)${re}$` : `^${re}$`, 'i');
+}
+
+const REPEAT_LINES = 6;
+
+// A block of at least REPEAT_LINES meaningful lines that appears more than once (weak models paste a page twice).
+function repeatedBlock(text) {
+  const lines = String(text || '').split(/\r?\n/).map((l) => l.trim());
+  const seen = new Map();
+  for (let i = 0; i + REPEAT_LINES <= lines.length; i++) {
+    const chunk = lines.slice(i, i + REPEAT_LINES);
+    if (chunk.filter((l) => l.replace(/[{}()[\];,<>/]/g, '').length > 2).length < REPEAT_LINES - 1) continue;
+    const key = chunk.join('\n');
+    if (seen.has(key) && i - seen.get(key) >= REPEAT_LINES) return chunk[0];
+    if (!seen.has(key)) seen.set(key, i);
+  }
+  return null;
+}
+
+// Where `needle` sits in `text` when indentation and trailing spaces are ignored: { start, end } or null (none or several).
+function looseMatch(text, needle) {
+  const lines = text.split('\n');
+  const want = needle.replace(/\r/g, '').split('\n').map((l) => l.trim());
+  while (want.length && !want[want.length - 1]) want.pop();
+  while (want.length && !want[0]) want.shift();
+  if (!want.length) return null;
+  const hits = [];
+  for (let i = 0; i + want.length <= lines.length; i++) {
+    let ok = true;
+    for (let k = 0; k < want.length; k++) {
+      if (lines[i + k].replace(/\r$/, '').trim() !== want[k]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) hits.push(i);
+    if (hits.length > 1) return null;
+  }
+  if (hits.length !== 1) return null;
+  const start = lines.slice(0, hits[0]).reduce((n, l) => n + l.length + 1, 0);
+  const end = start + lines.slice(hits[0], hits[0] + want.length).join('\n').length;
+  return { start, end };
 }
 
 function killTree(child) {
@@ -207,7 +251,7 @@ class WorkspaceTools {
 
   access(name, rawArgs) {
     const args = normalizeArgs(rawArgs);
-    if (name === 'edit_file' || name === 'write_file') {
+    if (name === 'edit_file' || name === 'write_file' || name === 'generate_image') {
       try {
         this.resolve(args.path, 'write');
       } catch (err) {
@@ -260,8 +304,20 @@ class WorkspaceTools {
     return { added: added.length, removed: removed.length, isNew: before === null, lines };
   }
 
+  // How many source files the project has (counting stops at `cap`); cached for a minute.
+  countSourceFiles(cap = 200) {
+    if (this._sourceCount && Date.now() - this._sourceCount.at < 60000) return this._sourceCount.n;
+    let n = 0;
+    this._walk(this.root, (file) => {
+      if (SOURCE_EXTENSIONS.has(path.extname(file).toLowerCase())) n++;
+      return n < cap;
+    });
+    this._sourceCount = { at: Date.now(), n };
+    return n;
+  }
+
   listSourceFiles(limit = 6) {
-    const exts = new Set(['.html', '.htm', '.css', '.js', '.mjs', '.ts', '.tsx', '.jsx', '.py', '.json', '.md', '.go', '.rs', '.java', '.php', '.vue', '.svelte']);
+    const exts = SOURCE_EXTENSIONS;
     const found = [];
     let visited = 0;
     this._walk(this.root, (file) => {
@@ -430,6 +486,10 @@ class WorkspaceTools {
       case 'read_file': return `Reading ${args.path || ''}`;
       case 'search_text': return `Searching "${args.query || ''}"`;
       case 'edit_file': return `Editing ${args.path || ''}`;
+      case 'generate_image': return `Drawing ${args.path || 'a picture'}`;
+      case 'semantic_search': return `Searching for "${args.query || ''}"`;
+      case 'web_fetch': return `Reading ${args.url || 'a web page'}`;
+      case 'get_problems': return `Checking problems${args.path ? ` in ${args.path}` : ''}`;
       case 'write_file': {
         let exists = false;
         try {
@@ -440,7 +500,10 @@ class WorkspaceTools {
         return `${exists ? 'Updating' : 'Creating'} ${args.path || ''}`;
       }
       case 'run_command': return `Running ${args.command || ''}`;
-      default: return name;
+      default: {
+        const mcp = String(name).match(/^mcp__(.+?)__(.+)$/);
+        return mcp ? `${mcp[1]}: ${mcp[2]}` : name;
+      }
     }
   }
 
@@ -467,6 +530,15 @@ class WorkspaceTools {
     }
     if (name === 'run_command') {
       return { kind: 'command', command: args.command || '' };
+    }
+    if (name === 'web_fetch') {
+      return { kind: 'mcp', args: String(args.url || '') };
+    }
+    if (/^mcp__/.test(String(name))) {
+      return { kind: 'mcp', args: truncate(JSON.stringify(args, null, 2), 800) };
+    }
+    if (name === 'generate_image') {
+      return { kind: 'file', path: args.path, exists: false, lines: 1, head: `Picture: ${truncate(String(args.prompt || ''), 500)}` };
     }
     return null;
   }
@@ -671,6 +743,18 @@ class WorkspaceTools {
     const target = toFile(oldString);
     const first = text.indexOf(target);
     if (first === -1) {
+      const loose = looseMatch(text, oldString);
+      if (loose) {
+        // The match covers whole lines: move the new code to the file's indentation, keeping its inner structure.
+        const indent = (text.slice(loose.start).match(/^[ \t]*/) || [''])[0];
+        const firstLine = oldString.replace(/^\s*\n/, '');
+        const wantedIndent = (firstLine.match(/^[ \t]*/) || [''])[0];
+        const replacement = newString.replace(/^\s*\n/, '').replace(/\s+$/, '').split('\n')
+          .map((l) => (!l.trim() ? '' : indent + (l.startsWith(wantedIndent) ? l.slice(wantedIndent.length) : l.trimStart())))
+          .join('\n');
+        fs.writeFileSync(abs, text.slice(0, loose.start) + toFile(replacement) + text.slice(loose.end));
+        return `Edited ${this.relative(abs)} (matched ignoring indentation)`;
+      }
       throw new Error(
         `old_string was not found in ${this.relative(abs)}. Here is the file as it is now:\n${truncate(text, 4000)}\n---\nCopy old_string exactly from it, or (better for a small file) call write_file with the complete updated content.`
       );
@@ -690,6 +774,10 @@ class WorkspaceTools {
     const existed = fs.existsSync(abs);
     if (existed && !content.trim() && fs.readFileSync(abs, 'utf8').trim()) {
       throw new Error(`Refusing to replace ${this.relative(abs)} with an empty file. Write the complete new content, or use edit_file for a small change.`);
+    }
+    const repeated = repeatedBlock(content);
+    if (repeated && !repeatedBlock(existed ? fs.readFileSync(abs, 'utf8') : '')) {
+      throw new Error(`Not saved: the new content repeats a block of code (starting with "${repeated.slice(0, 80)}"). Write every part of the file only once: give the complete file with each section exactly one time.`);
     }
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content);
@@ -727,4 +815,4 @@ class WorkspaceTools {
   }
 }
 
-module.exports = { WorkspaceTools, normalizeArgs, truncate, globToRegExp };
+module.exports = { WorkspaceTools, normalizeArgs, truncate, globToRegExp, repeatedBlock, looseMatch };

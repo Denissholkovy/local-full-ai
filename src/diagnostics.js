@@ -37,12 +37,14 @@ async function build(context, ollamaClient) {
   }
 
   const connected = [];
-  for (const id of ['groq', 'openrouter', 'gemini', 'mistral', 'cerebras', 'custom']) {
+  for (const id of require('./cloudProviders').PROVIDERS.map((p) => p.id)) {
     try {
       if (await context.secrets.get(`localAI.key.${id}`)) connected.push(id);
     } catch (_) {
     }
   }
+  const servers = context.globalState.get('localAI.customServers', []);
+  if (servers.length) connected.push(`${servers.length} OpenAI-compatible server(s)`);
   const selected = context.globalState.get('localAI.selectedModel') || 'none';
   const cloudModels = context.globalState.get('localAI.cloudModels', []).map((m) => m.name);
 

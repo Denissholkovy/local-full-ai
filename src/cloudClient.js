@@ -1,17 +1,35 @@
-const { parseName, provider } = require('./cloudProviders');
+const { parseName, provider, setServers } = require('./cloudProviders');
 const limits = require('./cloudLimits');
 const capabilities = require('./modelCapabilities');
 const loopGuard = require('./loopGuard');
 
 const MAX_RETRIES = 5;
 const MAX_WAIT_S = 60;
-const REQUEST_TIMEOUT_MS = 120000;
+const IDLE_TIMEOUT_MS = 90000;
 
 function lenientJson(text) {
   try {
     return JSON.parse(text);
   } catch (_) {
     return {};
+  }
+}
+
+function keyOptional(providerId) {
+  const def = provider(providerId);
+  return !!(def && def.server);
+}
+
+function authHeaders(key) {
+  return key ? { Authorization: `Bearer ${key}` } : {};
+}
+
+function isJson(text) {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch (_) {
+    return false;
   }
 }
 
@@ -84,12 +102,17 @@ function toOpenAIMessages(messages, providerId) {
 class CloudClient {
   constructor(context) {
     this._context = context;
+    setServers(context.globalState.get('localAI.customServers', []));
     capabilities.setCloudCaps(context.globalState.get('localAI.cloudCaps', {}));
     limits.loadModelCaps(context.globalState.get('localAI.cloudModelCaps', {}));
   }
 
   async _key(providerId) {
     return (await this._context.secrets.get(`localAI.key.${providerId}`)) || '';
+  }
+
+  async credentials(providerId) {
+    return { key: await this._key(providerId), baseUrl: await this._baseUrl(providerId) };
   }
 
   async _baseUrl(providerId) {
@@ -103,8 +126,16 @@ class CloudClient {
   async listModels(providerId) {
     const key = await this._key(providerId);
     const base = await this._baseUrl(providerId);
-    if (!key) throw new Error('No API key saved for this provider.');
+    if (!key && !keyOptional(providerId)) throw new Error('No API key saved for this provider.');
     if (!base) throw new Error('No address set for this provider.');
+    if (providerId === 'anthropic') {
+      // Anthropic lists its models only through its own API, with its own key header.
+      const res = await fetch('https://api.anthropic.com/v1/models?limit=1000', { headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' } });
+      if (res.status === 401 || res.status === 403) throw new Error('The provider rejected the API key.');
+      if (!res.ok) throw new Error(`The provider answered ${res.status}.`);
+      const data = await res.json();
+      return (data.data || []).map((m) => m.id).filter(Boolean);
+    }
     if (providerId === 'gemini') {
       // The native list says which models can chat (generateContent); the OpenAI-style list does not.
       try {
@@ -117,7 +148,7 @@ class CloudClient {
       } catch (_) {
       }
     }
-    const res = await fetch(`${base}/models`, { headers: { Authorization: `Bearer ${key}` } });
+    const res = await fetch(`${base}/models`, { headers: authHeaders(key) });
     if (res.status === 401 || res.status === 403) throw new Error('The provider rejected the API key.');
     if (!res.ok) throw new Error(`The provider answered ${res.status}.`);
     const data = await res.json();
@@ -183,10 +214,10 @@ class CloudClient {
   async chatStream(fullName, messages, onToken, options = {}) {
     const parsed = parseName(fullName);
     if (!parsed) throw new Error(`"${fullName}" is not a cloud model.`);
-    const { onAbortReady, onStats, onThinking, tools, generation, onNotice, onLimits, maxTokens, quick } = options;
+    const { onAbortReady, onStats, onThinking, tools, generation, onNotice, onLimits, maxTokens, quick, failFast } = options;
     const key = await this._key(parsed.providerId);
     const base = await this._baseUrl(parsed.providerId);
-    if (!key) throw new Error(`No API key for ${provider(parsed.providerId).name}. Add it in the sidebar under Cloud models.`);
+    if (!key && !keyOptional(parsed.providerId)) throw new Error(`No API key for ${provider(parsed.providerId).name}. Add it in the sidebar under Cloud models.`);
     if (!base) throw new Error('No address set for this provider.');
 
     const body = {
@@ -196,7 +227,7 @@ class CloudClient {
       stream_options: { include_usage: true },
       max_tokens: maxTokens || 4096
     };
-    if (generation) {
+    if (generation && !(provider(parsed.providerId) || {}).noSampling) {
       if (generation.temperature !== undefined) body.temperature = generation.temperature;
       if (generation.top_p !== undefined) body.top_p = generation.top_p;
     }
@@ -210,12 +241,24 @@ class CloudClient {
         controller.abort();
       });
     }
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    // Only silence counts as a timeout: waiting for limits or retries does not, and every chunk resets it.
+    let timer = null;
+    let timedOut = false;
+    const idle = {
+      arm: () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, IDLE_TIMEOUT_MS);
+      },
+      pause: () => clearTimeout(timer)
+    };
 
     // Look at the provider's remaining per-minute budget and wait for the reset instead of running into a 429.
     if (!quick) {
       const estimate = Math.ceil(JSON.stringify(body.messages).length / 3.5) + (body.tools ? Math.ceil(JSON.stringify(body.tools).length / 3.5) : 0) + 300;
-      const pause = limits.waitFor(parsed.providerId, estimate);
+      const pause = limits.waitFor(parsed.providerId, estimate, parsed.modelId);
       if (pause > 0.5 && pause <= 65) {
         if (onNotice) onNotice(`${provider(parsed.providerId).name}: the per-minute token budget is almost used. Waiting ${Math.ceil(pause)}s so the request is not rejected...`);
         await new Promise((resolve) => {
@@ -228,6 +271,7 @@ class CloudClient {
     let content = '';
     const calls = new Map();
     let usage = null;
+    let finishReason = '';
     let looped = false;
     const watchLoop = loopGuard.makeWatcher();
     const started = Date.now();
@@ -235,15 +279,17 @@ class CloudClient {
     try {
       let res;
       for (let attempt = 1; ; attempt++) {
+        idle.arm();
         res = await fetch(`${base}/chat/completions`, {
           method: 'POST',
-          headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+          headers: { ...authHeaders(key), 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
           signal: controller.signal
         });
+        idle.pause();
         const seen = limits.record(parsed.providerId, parsed.modelId, limits.parseHeaders(res.headers));
         if (onLimits) onLimits(seen);
-        if ([500, 502, 503, 504, 529].includes(res.status) && attempt <= 4 && !quick) {
+        if ([500, 502, 503, 504, 529].includes(res.status) && attempt <= 4 && !quick && !failFast) {
           // Temporary overload on the provider's side: wait a little and try again.
           const wait = [2, 4, 8, 12][attempt - 1] || 12;
           if (onNotice) onNotice(`${provider(parsed.providerId).name} is busy right now (error ${res.status}). Trying again in ${wait}s (${attempt}/4)...`);
@@ -256,6 +302,14 @@ class CloudClient {
             }, { once: true });
           });
           continue;
+        }
+        if (res.status === 400 && body.max_tokens > 4096) {
+          const peek = await res.clone().text().catch(() => '');
+          if (/max_tokens|max_completion_tokens|max_output_tokens|maximum.*(output|completion) tokens/i.test(peek)) {
+            body.max_tokens = 4096;
+            await res.text().catch(() => '');
+            continue;
+          }
         }
         if (res.status === 429 && attempt <= MAX_RETRIES) {
           const peek = await res.clone().text().catch(() => '');
@@ -274,6 +328,8 @@ class CloudClient {
             }
             throw new Error(`${pname}: this request is larger than the free per-minute token limit${m ? ` (limit ${m[1]}, requested ${m[2]})` : ''}. Lower "Cloud context size" in Settings, or use a model with a bigger limit.`);
           }
+          // Another model is ready to take over: switching is faster than waiting for the reset.
+          if (failFast) break;
           const header = Number(res.headers.get('retry-after'));
           let hinted = 0;
           const again = peek.match(/try again in\s+(?:(\d+)m)?\s*(\d+(?:\.\d+)?)(ms|s)/i);
@@ -339,6 +395,7 @@ class CloudClient {
         }
         if (evt.error) throw new Error(evt.error.message || 'The provider reported an error.');
         if (evt.usage) usage = evt.usage;
+        if (evt.choices && evt.choices[0] && evt.choices[0].finish_reason) finishReason = evt.choices[0].finish_reason;
         const delta = evt.choices && evt.choices[0] && evt.choices[0].delta;
         if (!delta) return;
         const thinking = delta.reasoning || delta.reasoning_content;
@@ -366,6 +423,7 @@ class CloudClient {
       };
 
       while (!done) {
+        idle.arm();
         const { value, done: finished } = await reader.read();
         if (finished) break;
         buffer += decoder.decode(value, { stream: true });
@@ -380,16 +438,18 @@ class CloudClient {
         return { content, toolCalls: [] };
       }
       if (aborted) return { content, toolCalls: [] };
-      if (err && err.name === 'AbortError') throw new Error('The cloud provider did not answer in time.');
+      if (timedOut || (err && err.name === 'AbortError')) throw new Error(`The cloud provider sent nothing for ${IDLE_TIMEOUT_MS / 1000}s and the request was stopped. Try again or pick another model.`);
       throw err;
     } finally {
-      clearTimeout(timer);
+      idle.pause();
     }
 
+    const truncated = finishReason === 'length';
+    // A call cut off by the output limit has broken arguments: running it would write a half file.
     const toolCalls = [...calls.entries()]
       .sort((a, b) => a[0] - b[0])
-      .map(([, c]) => ({ function: { name: c.name, arguments: c.args ? lenientJson(c.args) : {} }, ...(c.extra ? { extra_content: c.extra } : {}) }))
-      .filter((c) => c.function.name);
+      .filter(([, c]) => c.name && !(truncated && c.args && !isJson(c.args)))
+      .map(([, c]) => ({ function: { name: c.name, arguments: c.args ? lenientJson(c.args) : {} }, ...(c.extra ? { extra_content: c.extra } : {}) }));
 
     if (onStats) {
       const out = usage ? usage.completion_tokens || 0 : Math.ceil(content.length / 4);
@@ -401,7 +461,7 @@ class CloudClient {
         evalDuration: seconds * 1e9
       });
     }
-    return { content, toolCalls };
+    return { content, toolCalls, truncated };
   }
 }
 

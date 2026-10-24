@@ -2,7 +2,8 @@ const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const { ICONS } = require('../icons');
-const { isVisionModel, isCloudModelName, cloudCap } = require('../modelCapabilities');
+const capabilities = require('../modelCapabilities');
+const { isVisionModel, isCloudModelName, cloudCap } = capabilities;
 const ollamaProcess = require('../ollamaProcess');
 const { WorkspaceTools, normalizeArgs, truncate } = require('../tools');
 const skillsLib = require('../skills');
@@ -31,6 +32,7 @@ const MAX_TOOL_RESULT_CHARS = 8000;
 const VOICE_MAX_MS = 120000;
 const MAX_AGENT_STEPS = 25;
 const MAX_DUMP_NUDGES = 2;
+const MAX_CUT_NUDGES = 2;
 const CONTEXT_FILE_CHARS = 6000;
 const CONTEXT_TOTAL_CHARS = 14000;
 const AUTOPILOT_MAX_STEPS = 400;
@@ -115,6 +117,8 @@ function trimMessagesToFit(messages, maxChars) {
 
 function modelSupportsTools(name) {
   if (cloud.isCloudModel(name)) return cloudCap(name, 'tools') !== false;
+  const reported = capabilities.localCap(name, 'tools');
+  if (reported !== null) return reported;
   const entry = MODEL_CATALOG.find((m) => m.name === name);
   return entry ? (entry.tags || []).includes('tools') : true;
 }
@@ -196,7 +200,8 @@ function buildAgentPrompt(rootName) {
     '- When the user asks for a fix or a change, work on the existing files: read them first, then edit them. Do not start over.',
     '- Keep the layout simple: put a new standalone page or script in the project root (for example index.html, style.css, script.js) unless the project already has a clear structure. Use the file type the user asked for (an html request means .html, not a framework component).',
     '- Edits and commands need the user\'s approval. If an action is denied, do not retry it; ask what to do instead.',
-    '- When the task is done, summarise what you did in a few short sentences.',
+    '- When the task is done, summarise what you did in one to three short sentences: what changed and how to use it.',
+    '- For a question, give the answer in the first sentence, then only the details that help. No introductions.',
     '- Answer in the same language the user writes in.'
   ].join('\n');
 }
@@ -215,10 +220,11 @@ function buildFilesPrompt(rootName) {
     '- Create the files that are missing (for example index.html, style.css, script.js) with short relative paths.',
     '- Keep the layout simple: new standalone pages go in the project root. Use the file type the user asked for.',
     '- Outside file blocks write only one to three short sentences: what you did and how to use it.',
-    '- If the user only asks a question or wants to talk, answer in plain text without file blocks.',
+    '- If the user only asks a question or wants to talk, answer in plain text without file blocks: the answer first, short.',
+    '- A new feature must work: write all its HTML, CSS and JavaScript, not only the buttons.',
     '- Answer in the same language the user writes in.'
   ].join('\n');
 }
 
 
-module.exports = { vscode, fs, path, ICONS, isVisionModel, isCloudModelName, cloudCap, ollamaProcess, WorkspaceTools, normalizeArgs, truncate, skillsLib, workspaceLib, resolveWorkspaceRoot, agentTools, voice, modelState, agentFiles, generationLib, beforeContent, projectCheck, cloud, diagnostics, CloudClient, cloudLimits, MODEL_CATALOG, spawn, execFile, IMAGE_EXTENSIONS, TEXT_FILE_EXTENSIONS, MAX_TEXT_FILE_CHARS, MAX_TOOL_RESULT_CHARS, VOICE_MAX_MS, MAX_AGENT_STEPS, MAX_DUMP_NUDGES, CONTEXT_FILE_CHARS, CONTEXT_TOTAL_CHARS, AUTOPILOT_MAX_STEPS, MAX_NUDGES, MAX_REPEAT_WARNINGS, SUBAGENT_MAX_STEPS, MAX_SUBAGENT_REPORT_CHARS, RETRY_DELAY_MS, MAX_RETRIES, DEFAULT_CONTEXT_SIZE, CHARS_PER_TOKEN, LANGUAGE_BY_EXTENSION, estimateChars, shrinkToolOutputs, trimMessagesToFit, modelSupportsTools, languageNote, isSmallModel, isTinyModel, displayTitle, capDiff, toOllamaMessages, buildCompactAgentPrompt, compactTools, buildAgentPrompt, buildFilesPrompt };
+module.exports = { vscode, fs, path, ICONS, capabilities, isVisionModel, isCloudModelName, cloudCap, ollamaProcess, WorkspaceTools, normalizeArgs, truncate, skillsLib, workspaceLib, resolveWorkspaceRoot, agentTools, voice, modelState, agentFiles, generationLib, beforeContent, projectCheck, cloud, diagnostics, CloudClient, cloudLimits, MODEL_CATALOG, spawn, execFile, IMAGE_EXTENSIONS, TEXT_FILE_EXTENSIONS, MAX_TEXT_FILE_CHARS, MAX_TOOL_RESULT_CHARS, VOICE_MAX_MS, MAX_AGENT_STEPS, MAX_DUMP_NUDGES, MAX_CUT_NUDGES, CONTEXT_FILE_CHARS, CONTEXT_TOTAL_CHARS, AUTOPILOT_MAX_STEPS, MAX_NUDGES, MAX_REPEAT_WARNINGS, SUBAGENT_MAX_STEPS, MAX_SUBAGENT_REPORT_CHARS, RETRY_DELAY_MS, MAX_RETRIES, DEFAULT_CONTEXT_SIZE, CHARS_PER_TOKEN, LANGUAGE_BY_EXTENSION, estimateChars, shrinkToolOutputs, trimMessagesToFit, modelSupportsTools, languageNote, isSmallModel, isTinyModel, displayTitle, capDiff, toOllamaMessages, buildCompactAgentPrompt, compactTools, buildAgentPrompt, buildFilesPrompt };

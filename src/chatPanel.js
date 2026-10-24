@@ -1,4 +1,17 @@
-const { vscode, fs, path, ICONS, isVisionModel, isCloudModelName, ollamaProcess, WorkspaceTools, normalizeArgs, truncate, skillsLib, workspaceLib, resolveWorkspaceRoot, agentTools, voice, modelState, agentFiles, beforeContent, projectCheck, cloud, diagnostics, CloudClient, cloudLimits, spawn, MAX_TEXT_FILE_CHARS, MAX_TOOL_RESULT_CHARS, MAX_AGENT_STEPS, MAX_DUMP_NUDGES, AUTOPILOT_MAX_STEPS, MAX_NUDGES, MAX_REPEAT_WARNINGS, RETRY_DELAY_MS, MAX_RETRIES, CHARS_PER_TOKEN, trimMessagesToFit, modelSupportsTools, languageNote, isSmallModel, isTinyModel, displayTitle, capDiff, toOllamaMessages, buildCompactAgentPrompt, compactTools, buildAgentPrompt, buildFilesPrompt } = require('./chat/common');
+const { vscode, fs, path, ICONS, capabilities, isVisionModel, isCloudModelName, ollamaProcess, WorkspaceTools, normalizeArgs, truncate, skillsLib, workspaceLib, resolveWorkspaceRoot, agentTools, voice, modelState, agentFiles, beforeContent, projectCheck, cloud, diagnostics, CloudClient, cloudLimits, spawn, MAX_TEXT_FILE_CHARS, MAX_TOOL_RESULT_CHARS, MAX_AGENT_STEPS, MAX_DUMP_NUDGES, MAX_CUT_NUDGES, AUTOPILOT_MAX_STEPS, MAX_NUDGES, MAX_REPEAT_WARNINGS, RETRY_DELAY_MS, MAX_RETRIES, CHARS_PER_TOKEN, trimMessagesToFit, modelSupportsTools, languageNote, isSmallModel, isTinyModel, displayTitle, capDiff, toOllamaMessages, buildCompactAgentPrompt, compactTools, buildAgentPrompt, buildFilesPrompt } = require('./chat/common');
+
+const chatStore = require('./chatStore');
+const consent = require('./consent');
+const imageGen = require('./imageGen');
+const problems = require('./problems');
+const webFetch = require('./webFetch');
+const usageStats = require('./usageStats');
+const { stripLeakedThinking } = require('./ollamaClient');
+
+// From this many source files on, helper agents are offered for tasks (counting stops there).
+const BIG_PROJECT_FILES = 60;
+
+const OLLAMA_USAGE_URL = 'https://ollama.com/settings/usage';
 
 class ChatPanel {
   static currentPanel;
@@ -29,6 +42,8 @@ class ChatPanel {
     this._context = context;
     this._ollamaClient = ollamaClient;
     this._runs = new Map();
+    this._ready = false;
+    this._waiting = [];
     this._cloud = new CloudClient(context);
     this._recording = null;
     this._voiceTimer = null;
@@ -38,7 +53,8 @@ class ChatPanel {
     this._toolCounter = 0;
     this._tools = null;
 
-    this._sessions = this._context.globalState.get('localAI.chatSessions', []);
+    capabilities.setLocalCaps(this._context.globalState.get('localAI.localCaps', {}));
+    this._sessions = chatStore.load(this._context);
     if (!Array.isArray(this._sessions) || this._sessions.length === 0) {
       this._sessions = [this._createSessionObject()];
     }
@@ -65,7 +81,7 @@ class ChatPanel {
     const limitsWatcher = cloudLimits.onDidChange(({ providerId }) => {
       const selected = this._context.globalState.get('localAI.selectedModel');
       const parsed = cloud.parseName(selected);
-      if (parsed && parsed.providerId === providerId) this._post(this._limitsMessage(selected, cloudLimits.get(providerId)));
+      if (parsed && parsed.providerId === providerId) this._post(this._limitsMessage(selected, cloudLimits.get(providerId, parsed.modelId)));
     });
     const trustWatcher = vscode.workspace.onDidGrantWorkspaceTrust ? vscode.workspace.onDidGrantWorkspaceTrust(() => this._sendModelInfo()) : { dispose() {} };
     this._panel.onDidDispose(() => {
@@ -76,6 +92,7 @@ class ChatPanel {
       trustWatcher.dispose();
       this._stopAll();
       voice.cancelAll();
+      chatStore.flush();
       ChatPanel.currentPanel = undefined;
     });
   }
@@ -110,12 +127,17 @@ class ChatPanel {
         this._sendSessionsList();
         this._sendModelInfo();
         this._sendCurrentHistory();
+        this._ready = true;
+        this._waiting.splice(0).forEach((action) => action());
         break;
       case 'startOllamaServer':
         await this._startOllamaServer();
         break;
       case 'regenerate':
         await this._regenerate();
+        break;
+      case 'editMessage':
+        await this._editMessage(Number(msg.ordinal));
         break;
       case 'revertChanges':
         await this._revertChanges();
@@ -164,7 +186,7 @@ class ChatPanel {
         this._sendModelInfo();
         break;
       case 'openCloudLimits': {
-        const def = cloud.provider(msg.providerId);
+        const def = msg.providerId === 'ollama' ? { limitsUrl: OLLAMA_USAGE_URL } : cloud.provider(msg.providerId);
         if (def && def.limitsUrl) vscode.env.openExternal(vscode.Uri.parse(def.limitsUrl));
         break;
       }
@@ -208,9 +230,10 @@ class ChatPanel {
       if (firstUser && item.title === 'New chat') {
         const raw = displayTitle(firstUser).replace(/\s+/g, ' ').trim();
         item.title = raw.slice(0, 48) + (raw.length > 48 ? '...' : '');
+        chatStore.save(item);
       }
     });
-    this._context.globalState.update('localAI.chatSessions', this._sessions);
+    if (session) chatStore.save(session);
     this._context.globalState.update('localAI.currentSessionId', this._currentSessionId);
     this._sendSessionsList();
   }
@@ -230,9 +253,12 @@ class ChatPanel {
     if (current && !modelSupportsTools(current) && this._context.globalState.get('localAI.agentEnabled', true)) {
       text += ' (this model cannot use tools: it saves code into your project files but cannot read them on its own)';
     }
-    if (current && cloud.isCloudModel(current)) {
-      text += ` Cloud model: your messages and the files it reads are sent to ${this._cloudProviderName(current)}.`;
-    } else if (previous && cloud.isCloudModel(previous)) {
+    const goesTo = current && consent.destination(current);
+    if (current && cloud.isLocalServer(current)) {
+      text += ` Local server ${this._cloudProviderName(current)}: nothing leaves your computer.`;
+    } else if (goesTo) {
+      text += ` Cloud model: your messages and the files it reads are sent to ${goesTo.name}.`;
+    } else if (previous && consent.destination(previous)) {
       text += ' Back to a local model: nothing leaves your computer.';
     }
     if (running) text += ' - takes effect from your next message';
@@ -244,6 +270,7 @@ class ChatPanel {
 
   _onModelChanged({ previous, current }) {
     this._sendModelInfo();
+    this._ensureLocalCaps(current).then(() => this._sendModelInfo());
     const session = this._currentSession();
     if (session && session.history.some((m) => m.role === 'user')) {
       this._addModelNotice(session, previous, current);
@@ -290,7 +317,7 @@ class ChatPanel {
     const session = this._createSessionObject();
     this._sessions.push(session);
     this._currentSessionId = session.id;
-    this._persistSessions();
+    this._persistSessions(session);
     this._sendCurrentHistory();
     this._sendModelInfo();
   }
@@ -310,6 +337,7 @@ class ChatPanel {
     this._stopSession(id);
     this._dropUndo(this._sessions[idx]);
     this._sessions.splice(idx, 1);
+    chatStore.remove(id);
     this._grantsBySession.delete(id);
 
     if (this._sessions.length === 0) {
@@ -422,8 +450,10 @@ class ChatPanel {
       folderLevel: this._folderLevel(),
       modelName,
       supportsVision: isVisionModel(modelName),
-      cloudProvider: modelName ? this._cloudProviderName(modelName) : null,
-      cloudLimits: modelName && cloud.isCloudModel(modelName) ? this._limitsMessage(modelName, cloudLimits.get((cloud.parseName(modelName) || {}).providerId)) : null,
+      cloudProvider: modelName && consent.destination(modelName) ? consent.destination(modelName).name : null,
+      cloudProviderId: modelName && consent.destination(modelName) ? consent.destination(modelName).id : null,
+      workMode: (this._currentSession() || {}).lastProfile || null,
+      cloudLimits: modelName && cloud.isCloudModel(modelName) ? this._limitsMessage(modelName, cloudLimits.get((cloud.parseName(modelName) || {}).providerId, (cloud.parseName(modelName) || {}).modelId)) : null,
       workspaceName: root ? path.basename(root) : null,
       agentEnabled: this._context.globalState.get('localAI.agentEnabled', true),
       trusted: workspaceLib.isTrusted(),
@@ -459,8 +489,18 @@ class ChatPanel {
     }
   }
 
+  // Messages posted before the webview has loaded are lost, so actions wait for its "ready".
+  _whenReady(action) {
+    if (this._ready) action();
+    else this._waiting.push(action);
+  }
+
   seedMessage(text) {
-    this._post({ type: 'seed', text });
+    this._whenReady(() => this._post({ type: 'seed', text }));
+  }
+
+  sendMessage(text) {
+    this._whenReady(() => this._handleUserMessage(text, []));
   }
 
   async _handleUserMessage(text, attachments) {
@@ -486,24 +526,6 @@ class ChatPanel {
 
     const userMessage = { role: 'user', content: text };
     const contentParts = [];
-
-    const includeActiveFile = this._context.globalState.get('localAI.includeActiveFile', false);
-    if (includeActiveFile) {
-      const editor = vscode.window.activeTextEditor;
-      if (editor) {
-        const fileName = path.basename(editor.document.fileName);
-        let fileText = editor.document.getText();
-        let truncated = false;
-        if (fileText.length > MAX_TEXT_FILE_CHARS) {
-          fileText = fileText.slice(0, MAX_TEXT_FILE_CHARS);
-          truncated = true;
-        }
-        const lang = editor.document.languageId || '';
-        contentParts.push(
-          `Active file (${fileName}${truncated ? ', truncated' : ''}):\n\`\`\`${lang}\n${fileText}\n\`\`\``
-        );
-      }
-    }
 
     const attachmentList = Array.isArray(attachments) ? attachments : (attachments ? [attachments] : []);
 
@@ -542,7 +564,6 @@ class ChatPanel {
 
     userMessage.display = {
       text,
-      includedActiveFile: includeActiveFile && !!vscode.window.activeTextEditor,
       attachments: attachmentList
         .filter((att) => att.kind === 'text')
         .map((att) => ({ kind: 'text', name: att.name, language: att.language, content: att.content }))
@@ -552,7 +573,6 @@ class ChatPanel {
     this._post({
       type: 'userMessage',
       text,
-      includedActiveFile: includeActiveFile && !!vscode.window.activeTextEditor,
       attachments: attachmentList.map((att) => ({
         kind: att.kind,
         name: att.name,
@@ -637,8 +657,29 @@ class ChatPanel {
     return this._context.globalState.get('localAI.permissionMode', 'ask');
   }
 
-  _multiAgentEnabled() {
-    return vscode.workspace.getConfiguration('localAI').get('multiAgent') !== false;
+  // Helpers cost a lot of time (each starts from an empty context), so the model only gets them when they pay off:
+  // the user asked for them, autopilot works on a big task, or the project is large.
+  // The latest assistant text since the user's last own message (answers to earlier questions do not count).
+  _lastAnswerThisTurn(history) {
+    for (let i = history.length - 1; i >= 0; i--) {
+      const m = history[i];
+      if (m.role === 'user' && !m.synthetic) return null;
+      if (m.role === 'assistant' && typeof m.content === 'string' && m.content.trim()) return m;
+    }
+    return null;
+  }
+
+  // Standard and agent mode plan a task first (autopilot has its own plan).
+  _wantsPlan(ctx) {
+    return !ctx.isSub && !ctx.autopilot && !ctx.compact && !!ctx.tools && ctx.toolsEnabled && ['standard', 'agent'].includes(ctx.profile) &&
+      ctx.mode !== 'readonly' && agentTools.looksLikeTask(ctx.run.task);
+  }
+
+  _shouldOfferHelpers(modelName, tools, task, autopilot) {
+    if (isTinyModel(modelName) || !tools) return false;
+    if (agentTools.mentionsAgents(task)) return true;
+    const large = tools.countSourceFiles(BIG_PROJECT_FILES) >= BIG_PROJECT_FILES;
+    return large && (autopilot || agentTools.looksLikeTask(task));
   }
 
   _systemPrompt(ctx) {
@@ -690,10 +731,19 @@ class ChatPanel {
       if (tools && ctx.toolsEnabled && !ctx.compact && ctx.mode !== 'readonly') {
         parts.push('Project memory: when you learn something lasting about this project (how to run or test it, a convention, where something lives, a mistake to avoid), call remember with one short sentence. Do not store task details.');
       }
+      if (tools && ctx.embedModel && !ctx.compact) {
+        parts.push('Finding code: when you do not know the exact names, call semantic_search with a plain description; use search_text for exact names.');
+      }
+      if (this._imagesEnabled(ctx)) {
+        parts.push('Pictures: when the project needs a photo, illustration or background, call generate_image and use the saved path in the code. Draw icons, logos and simple shapes as SVG files instead.');
+      }
       if (tools && ctx.canDelegate && !ctx.compact) {
         parts.push(
-          'Helper agents: for a big investigation or a self-contained sub-job, call delegate_task (mode "research" to read, "worker" to change). Give the helper full instructions because it cannot see this chat. Delegate independent jobs in the same turn so they run in parallel. Do small tasks yourself.'
+          'Helper agents (delegate_task) are slow: each one starts from nothing. Do the work yourself by default. Delegate only when the job spans many files or several independent areas that can run in parallel (for example mapping three unrelated parts of a large codebase), or when the user asks for helpers. Never delegate a single file, a small change, or a question you can answer by reading a few files. When you delegate, write a full brief (goal, known files, what you already know, the exact report you need) and start the independent helpers in the same turn.'
         );
+      }
+      if (this._wantsPlan(ctx)) {
+        parts.push('For a task with more than one step, first call update_plan with 2-5 items, each a result that can be checked (for example "buttons 0-9 and + - * / are on the page", "pressing = shows the result"). Mark items done as you finish them, and stop only when all are done. Skip the plan for a one-step change.');
       }
       if (!autopilot && ctx.toolsEnabled && !ctx.compact) {
         parts.push('If the request is ambiguous or you need a decision you cannot safely guess, call ask_user with one short question and 2-4 options instead of guessing. Do not ask about trivial details.');
@@ -720,6 +770,8 @@ class ChatPanel {
     const userSystemPrompt = this._context.globalState.get('localAI.systemPrompt') || '';
     if (userSystemPrompt) parts.push(userSystemPrompt);
     if (ctx.autoSkillsText && !ctx.isSub && !ctx.compact) late.push(ctx.autoSkillsText);
+    const summary = this._summaryNote(ctx);
+    if (summary) late.push(summary);
     const lang = languageNote(run.lang);
     return (lang && !ctx.isSub ? [lang, ...parts, ...late] : [...parts, ...late]).join('\n\n');
   }
@@ -727,6 +779,10 @@ class ChatPanel {
   _toolDefinitions(ctx) {
     if (!ctx.toolsEnabled) return undefined;
     let defs = ctx.tools ? WorkspaceTools.definitions() : [];
+    if (ctx.tools && ctx.embedModel) defs = [...defs, this._semanticDefinition()];
+    if (ctx.tools) defs = [...defs, problems.DEFINITION];
+    if (ctx.tools && !ctx.autopilot && !ctx.compact && vscode.workspace.getConfiguration('localAI').get('webFetch') !== false) defs = [...defs, webFetch.DEFINITION];
+    const mcpDefs = this._mcpDefinitions(ctx);
     if (ctx.isSub && ctx.subMode === 'research') {
       defs = defs.filter((d) => agentTools.READ_ONLY_TOOLS.has(d.function.name));
     }
@@ -734,21 +790,26 @@ class ChatPanel {
       defs = defs.filter((d) => agentTools.READ_ONLY_TOOLS.has(d.function.name) || d.function.name === 'run_command');
     }
     if (ctx.skills.length && !ctx.compact) defs = [...defs, skillsLib.USE_SKILL_DEFINITION];
+    if (this._imagesEnabled(ctx)) defs = [...defs, imageGen.DEFINITION];
     if (!ctx.isSub) {
       const wantsAgents = agentTools.mentionsAgents(ctx.run.task);
       if (ctx.tools && ctx.canDelegate && (!ctx.compact || wantsAgents)) defs = [...defs, agentTools.DELEGATE_DEFINITION];
       if (ctx.tools && !ctx.compact && ctx.mode !== 'readonly') defs = [...defs, agentTools.REMEMBER_DEFINITION];
       if (ctx.autopilot) defs = [...defs, agentTools.PLAN_DEFINITION, agentTools.FINISH_DEFINITION];
+      else if (this._wantsPlan(ctx)) defs = [...defs, agentTools.PLAN_DEFINITION];
       else if (!ctx.compact) defs = [...defs, agentTools.ASK_DEFINITION];
     }
     if (ctx.compact && defs.length) defs = compactTools(defs);
+    if (mcpDefs.length) defs = [...defs, ...mcpDefs];
     return defs.length ? defs : undefined;
   }
 
   _buildMessages(ctx) {
     const system = this._systemPrompt(ctx);
     const working = !!(ctx.filesMode || (ctx.toolsEnabled && ctx.tools));
-    let visible = ctx.history.filter((m) => m.role !== 'notice' && m.role !== 'step');
+    let visible = this._visibleHistory(ctx)
+      .filter((m) => m.role !== 'notice' && m.role !== 'step')
+      .map((m) => (m.role === 'assistant' && typeof m.content === 'string' && m.content.includes('</think>') ? { ...m, content: stripLeakedThinking(m.content) } : m));
     if (working && !ctx.isSub) {
       const lastUserIndex = visible.map((m) => m.role).lastIndexOf('user');
       visible = visible.map((m, i) => {
@@ -799,12 +860,13 @@ class ChatPanel {
       changes: new Map(),
       awake: null
     };
-    this._dropUndo(session);
+    session.lastChanges = null;
     this._postFor(session, { type: 'changesSummary', files: [] });
     this._runs.set(session.id, run);
     this._sendSessionsList();
 
     const lastUser = [...session.history].reverse().find((m) => m.role === 'user' && !m.synthetic);
+    const userIndex = session.history.lastIndexOf(lastUser);
     run.task = lastUser ? displayTitle(lastUser).slice(0, 2000) : '';
     if (isTinyModel(modelName) && !session.tinyWarned && agentTools.looksLikeTask(run.task)) {
       session.tinyWarned = true;
@@ -816,11 +878,29 @@ class ChatPanel {
     run.lang = session.lang || null;
     if (autopilot) this._keepAwake(run);
 
+    await this._ensureLocalCaps(modelName);
+    const embedModel = vscode.workspace.isTrusted !== false ? await this._embeddingModel() : null;
     const agentEnabled = this._context.globalState.get('localAI.agentEnabled', true);
-    const nativeTools = !this._noToolsModels.has(modelName) && modelSupportsTools(modelName);
+    const toolCapable = !this._noToolsModels.has(modelName) && modelSupportsTools(modelName);
+    const profile = await this._workProfile(modelName, toolCapable);
+    run.profile = profile.mode;
+    // In the fast mode the model gets the files and answers with complete files instead of a tool loop.
+    const nativeTools = toolCapable && profile.mode !== 'direct';
     const agentOn = agentEnabled && nativeTools;
     const tools = agentEnabled ? this._getTools() : null;
+    if (tools) run.problemsBefore = problems.collect(tools.root, { errorsOnly: true, limit: 500 });
+    const mcp = agentEnabled && nativeTools && tools ? await this._mcpTools() : null;
     const filesMode = agentEnabled && !nativeTools && !!tools;
+    if (session.lastProfile !== profile.mode && tools) {
+      session.lastProfile = profile.mode;
+      this._sendModelInfo();
+      const text = {
+        direct: `Fast mode (${profile.reason}): the model gets the relevant files and answers in one pass, without a tool loop.`,
+        standard: `Standard mode (${profile.reason}): the model works with tools and a short plan, without helper agents.`,
+        agent: `Agent mode (${profile.reason}): full tool loop, with helper agents for big jobs.`
+      }[profile.mode];
+      this._postFor(session, { type: 'notice', text });
+    }
     const skills = agentOn && !isSmallModel(modelName) ? this._skills() : [];
     const autoSkills = this._pickAutoSkills(session, run.task, modelName, nativeTools);
 
@@ -838,8 +918,11 @@ class ChatPanel {
       filesMode,
       compact: cloud.isCloudModel(modelName) && this._cloudBudget(modelName) <= 8000,
       autoSkillsText: autoSkills.text,
+      embedModel,
+      mcp,
       userText: run.task,
-      canDelegate: this._multiAgentEnabled() && !isTinyModel(modelName),
+      canDelegate: profile.mode === 'agent' && this._shouldOfferHelpers(modelName, tools, run.task, autopilot),
+      profile: profile.mode,
       toolsEnabled: agentOn && (!!tools || skills.length > 0),
       usage: this._usage(session).main,
       label: '',
@@ -850,14 +933,17 @@ class ChatPanel {
     };
 
     try {
+      await this._maybeCompact(ctx);
       await this._agentLoop(ctx);
       if (!run.stopped && ctx.tools && run.changes.size) await this._verifyAndFix(ctx);
+      if (autopilot && ctx.filesMode && !run.stopped) run.finished = true;
     } finally {
       if (run.awake) run.awake.kill();
       this._runs.delete(session.id);
       this._sendSessionsList();
       if (run.changes.size > 0) {
-        session.lastChanges = this._saveUndo(session, [...run.changes.values()]);
+        const record = this._saveUndo(session, [...run.changes.values()]);
+        if (record) this._addCheckpoint(session, userIndex, record);
         this._persistSessions(session);
         if (session.lastChanges) ctx.post({ type: 'changesSummary', files: session.lastChanges.files });
       }
@@ -895,6 +981,7 @@ class ChatPanel {
             onLimits: (seen) => this._postFor(ctx.session, this._limitsMessage(ctx.modelName, seen)),
             onThinking: () => ctx.ui && post({ type: 'assistantThinking' }),
             onStats: (stats) => {
+              usageStats.record(this._context, ctx.modelName, stats);
               if (ctx.usage) {
                 ctx.usage.prompt += stats.promptEvalCount || 0;
                 ctx.usage.output += stats.evalCount || 0;
@@ -910,6 +997,12 @@ class ChatPanel {
         if (attempt >= maxAttempts) throw err;
         const refused = err.code === 'ECONNREFUSED' || /ECONNREFUSED/.test(err.message);
         if (refused) ollamaProcess.startServer();
+        // The next attempt starts the answer again: the cut-off text of this one must not stay in front of it.
+        if (ctx.ui && run.partial) {
+          run.partial = '';
+          post({ type: 'assistantDiscard' });
+          post({ type: 'assistantStart', modelName: ctx.modelName, supportsVision: isVisionModel(ctx.modelName), hideCode: !!(ctx.filesMode || (ctx.toolsEnabled && ctx.tools)) });
+        }
         post({
           type: 'contextTrimmed',
           text: `Model error (${err.message}). Retrying ${attempt}/${maxAttempts - 1}...`
@@ -927,6 +1020,9 @@ class ChatPanel {
     const fakeUser = (content) => history.push({ role: 'user', content, synthetic: true });
     let nudges = 0;
     let dumpNudges = 0;
+    let cutNudges = 0;
+    let saveRetries = 0;
+    let planNudges = 0;
     let wrote = false;
     let delegated = false;
     let repeatWarnings = 0;
@@ -967,6 +1063,10 @@ class ChatPanel {
           step--;
           continue;
         }
+        if (await this._switchAfterLimit(ctx, err)) {
+          step--;
+          continue;
+        }
         const isConnRefused = err.code === 'ECONNREFUSED' || /ECONNREFUSED/.test(err.message);
         post({
           type: 'error',
@@ -982,6 +1082,17 @@ class ChatPanel {
       let content = result.content;
       let toolCalls = run.stopped ? [] : result.toolCalls;
 
+      if (result.truncated && !run.stopped && toolCalls.length === 0) {
+        if (ctx.toolsEnabled && ctx.tools && cutNudges < MAX_CUT_NUDGES) {
+          cutNudges++;
+          if (ctx.ui) post({ type: 'assistantDiscard' });
+          fakeUser('[system] Your last reply hit the output length limit and was cut off, so nothing was saved. Write big files in parts: create the file with write_file holding the first part, then append the rest with edit_file, or split the code into several smaller files. Do it now.');
+          ctx.persist();
+          continue;
+        }
+        post({ type: 'contextTrimmed', text: 'The answer reached the model\'s output limit and was cut off.' });
+      }
+
       if (toolCalls.length === 0 && ctx.toolsEnabled && !run.stopped) {
         const defs = this._toolDefinitions(ctx) || [];
         const extracted = agentTools.extractTextToolCalls(content, new Set(defs.map((d) => d.function.name)));
@@ -994,6 +1105,13 @@ class ChatPanel {
 
       if (ctx.filesMode && !run.stopped && toolCalls.length === 0) {
         const saved = await this._saveCodeAsFiles(ctx, content);
+        // A file that could not be saved (for example a page written twice) gets one more try with the reason.
+        if (saved !== null && (run.saveErrors || []).length && saveRetries < 1 && !run.stopped) {
+          saveRetries++;
+          fakeUser(`[system] These files were NOT saved:\n${run.saveErrors.join('\n')}\nGive the complete corrected files again in <file path="..."> blocks.`);
+          ctx.persist();
+          continue;
+        }
         if (saved !== null) return saved;
         if (agentTools.looksLikeTask(run.task) && !agentTools.endsWithQuestion(content) && dumpNudges < MAX_DUMP_NUDGES) {
           dumpNudges++;
@@ -1030,7 +1148,7 @@ class ChatPanel {
             message = '[system] Do not paste code into the chat. Put it into the project files: call write_file to create or replace a file, or edit_file to change an existing one. Then reply with one or two short sentences. Do it now.';
           }
           if (needsDelegate) {
-            message = '[system] The user asked for helper agents. Call the delegate_task tool now, once per helper (give each a short "title", full "task" instructions including the file names, and mode "research"). Do not just say that you will; make the calls. After their reports arrive, summarize them.';
+            message = '[system] The user asked for helper agents. Call the delegate_task tool now, once per helper, with a full brief: a short "title", the "goal", the relevant "files", what is already "known", the "deliverable" you need, and mode "research". Do not just say that you will; make the calls. After their reports arrive, summarize them.';
           }
           if (asksContent) {
             message = '[system] Do not ask the user for the file content: you can read it yourself with read_file (or it is shown in your instructions). Read it if needed, then change the file with write_file (full updated content). Do it now.';
@@ -1053,6 +1171,12 @@ class ChatPanel {
         if (ctx.ui) post({ type: 'assistantReplace', text: content });
       }
 
+      const previous = this._lastAnswerThisTurn(history);
+      if (content && previous && agentTools.repeatsText(content, previous.content)) {
+        content = '';
+        if (ctx.ui) post({ type: 'assistantDiscard' });
+      }
+
       if (content || toolCalls.length > 0) {
         const assistantMessage = { role: 'assistant', content };
         if (toolCalls.length > 0) assistantMessage.tool_calls = toolCalls;
@@ -1063,6 +1187,14 @@ class ChatPanel {
       if (ctx.ui) post({ type: 'assistantEnd' });
 
       if (run.stopped) return lastText;
+
+      const openItems = run.plan.filter((it) => !it.done);
+      if (toolCalls.length === 0 && !ctx.autopilot && !ctx.isSub && openItems.length && planNudges < 1 && !run.stopped) {
+        planNudges++;
+        fakeUser(`[system] These plan items are not done yet:\n${agentTools.formatPlan(openItems)}\nFinish them with your tools (and mark them done with update_plan), then reply in one or two short sentences.`);
+        ctx.persist();
+        continue;
+      }
 
       if (toolCalls.length === 0) {
         if (shouldAct && !wrote && ctx.toolsEnabled && ctx.tools && !ctx.isSub && !ctx.autopilot) {
@@ -1101,7 +1233,8 @@ class ChatPanel {
       ctx.persist();
 
       if (run.finished) {
-        if (run.summary) {
+        const alreadySaid = this._lastAnswerThisTurn(history);
+        if (run.summary && !(alreadySaid && agentTools.repeatsText(run.summary, alreadySaid.content))) {
           history.push({ role: 'assistant', content: run.summary });
           ctx.persist();
           post({ type: 'assistantStart', modelName: ctx.modelName });
@@ -1174,10 +1307,13 @@ class ChatPanel {
     const name = (call.function && call.function.name) || 'unknown';
     const args = normalizeArgs(call.function && call.function.arguments);
     const id = `t${++this._toolCounter}`;
-    const noPathTools = ['use_skill', 'delegate_task', 'update_plan', 'finish_task', 'ask_user', 'remember'];
-    const permission = noPathTools.includes(name) || !tools
-      ? null
-      : WorkspaceTools.permissionFor(name);
+    const noPathTools = ['use_skill', 'delegate_task', 'update_plan', 'finish_task', 'ask_user', 'remember', 'semantic_search', 'get_problems'];
+    const mcpEntry = this._mcpEntry(ctx, name);
+    const permission = mcpEntry
+      ? (mcpEntry.readOnly ? null : `mcp:${mcpEntry.server}`)
+      : noPathTools.includes(name) || !tools
+        ? null
+        : WorkspaceTools.permissionFor(name);
 
     const baseLabel = {
       use_skill: `Skill ${args.name || ''}`,
@@ -1193,7 +1329,7 @@ class ChatPanel {
       id,
       name,
       label: `${ctx.label}${baseLabel}`,
-      path: noPathTools.includes(name) ? null : args.path || null
+      path: noPathTools.includes(name) || mcpEntry ? null : args.path || null
     };
     if (!ctx.isSub) run.currentTool = start;
     post(start);
@@ -1215,6 +1351,14 @@ class ChatPanel {
       denied = true;
       ok = false;
       output = 'This folder is set to "ask first" but autopilot cannot ask. Leave it unchanged and mention it in the summary.';
+    } else if (permission === 'web' && ctx.mode === 'autopilot') {
+      denied = true;
+      ok = false;
+      output = 'Blocked: autopilot cannot ask before reading a web page. Leave it out and mention it in the summary.';
+    } else if (mcpEntry && ctx.mode === 'autopilot' && this._mcpBlockedInAutopilot(mcpEntry)) {
+      denied = true;
+      ok = false;
+      output = `Blocked: autopilot cannot ask before using the MCP tool ${name}. Leave it out and mention it in the summary, or the user can mark the server "autoApprove" in localAI.mcpServers.`;
     } else if (permission && ctx.mode === 'readonly') {
       denied = true;
       ok = false;
@@ -1279,6 +1423,28 @@ class ChatPanel {
           }
         } else if (name === 'delegate_task') {
           output = await this._runSubAgent(args, ctx, id);
+        } else if (mcpEntry) {
+          output = await this._callMcp(mcpEntry, args);
+        } else if (name === 'web_fetch' && tools) {
+          const controller = new AbortController();
+          const abort = () => controller.abort();
+          run.aborts.add(abort);
+          try {
+            output = await webFetch.fetchText(String(args.url || ''), { signal: controller.signal });
+          } finally {
+            run.aborts.delete(abort);
+          }
+        } else if (name === 'get_problems' && tools) {
+          const scope = args.path ? tools.resolve(args.path) : null;
+          const inScope = (file) => !scope || file === scope || file.startsWith(scope + path.sep);
+          const found = problems.collect(tools.root, { errorsOnly: !!args.errors_only, limit: 1000 })
+            .filter((line) => inScope(path.resolve(tools.root, line.split(':')[0])))
+            .slice(0, 80);
+          output = found.length ? found.join('\n') : 'The Problems panel shows no errors or warnings here. (Files that are not open may not be checked by every language server.)';
+        } else if (name === 'semantic_search' && tools) {
+          output = await this._semanticSearch(ctx, args);
+        } else if (name === 'generate_image' && tools) {
+          output = await this._generateImage(ctx, args, id);
         } else if (!tools) {
           throw new Error('No project folder is open, so this tool is unavailable');
         } else {
@@ -1481,7 +1647,7 @@ class ChatPanel {
   }
 }
 
-for (const mixin of ['subagents', 'voiceInput', 'attachments', 'cloudSupport', 'filesMode', 'changes', 'verify']) {
+for (const mixin of ['subagents', 'voiceInput', 'attachments', 'cloudSupport', 'filesMode', 'changes', 'verify', 'compact', 'images', 'semantic', 'mcpTools', 'profile']) {
   Object.assign(ChatPanel.prototype, require(`./chat/${mixin}`));
 }
 

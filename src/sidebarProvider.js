@@ -8,6 +8,7 @@ class SidebarProvider {
     this._pullInProgress = new Set();
     this._pullAborts = new Map();
     this._cloudClient = new CloudClient(context);
+    require('./modelCapabilities').setLocalCaps(context.globalState.get('localAI.localCaps', {}));
   }
 
   resolveWebviewView(webviewView) {
@@ -59,14 +60,14 @@ class SidebarProvider {
         case 'openChat':
           await vscode.commands.executeCommand('localAI.openChat');
           break;
+        case 'ollamaSignin':
+          this._ollamaSignin();
+          break;
         case 'manualModel':
           await this._promptManualModel();
           break;
         case 'editSystemPrompt':
           await this._promptSystemPrompt();
-          break;
-        case 'editKeepAlive':
-          await this._promptKeepAlive();
           break;
         case 'setFolderLevel':
           await this._setFolderLevel(msg.path, msg.level);
@@ -131,20 +132,32 @@ class SidebarProvider {
         case 'chooseVariant':
           await this._chooseVariant(msg.modelName);
           break;
-        case 'chooseResponseMode':
-          await this._chooseResponseMode();
+        case 'chooseAgentMode':
+          await this._chooseAgentMode();
+          break;
+        case 'showUsageStats':
+          await this._showUsageStats();
+          break;
+        case 'chooseReviewerModel':
+          await this._chooseReviewerModel();
+          break;
+        case 'manageMcp':
+          await this._manageMcp();
+          break;
+        case 'chooseEmbeddingModel':
+          await this._chooseEmbeddingModel();
+          break;
+        case 'chooseAutocomplete':
+          await this._chooseAutocomplete();
+          break;
+        case 'chooseImageBackend':
+          await this._chooseImageBackend();
+          break;
+        case 'chooseThinking':
+          await this._chooseThinking();
           break;
         case 'chooseContext':
           await this._chooseContext();
-          break;
-        case 'chooseCloudContext':
-          await this._chooseCloudContext();
-          break;
-        case 'chooseGpu':
-          await this._chooseGpu();
-          break;
-        case 'chooseHelperModel':
-          await this._chooseHelperModel();
           break;
         case 'chooseVoiceEngine':
           await this._chooseVoiceEngine();
@@ -186,12 +199,12 @@ class SidebarProvider {
           if (known) await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(known.path));
           break;
         }
-        case 'toggleIncludeActiveFile': {
-          const current = this._context.globalState.get('localAI.includeActiveFile', false);
-          await this._context.globalState.update('localAI.includeActiveFile', !current);
-          await this._refreshState();
+        case 'toggleCloudFallback': {
+          const config = vscode.workspace.getConfiguration('localAI');
+          await config.update('cloudAutoFallback', config.get('cloudAutoFallback') !== true, vscode.ConfigurationTarget.Global);
           break;
         }
+
       }
   }
 
@@ -225,8 +238,16 @@ class SidebarProvider {
     return {
       selectedModel: this._context.globalState.get('localAI.selectedModel') || null,
       systemPrompt: this._context.globalState.get('localAI.systemPrompt') || '',
-      keepAlive: this._context.globalState.get('localAI.keepAlive') || '',
-      includeActiveFile: this._context.globalState.get('localAI.includeActiveFile', false),
+      cloudAutoFallback: vscode.workspace.getConfiguration('localAI').get('cloudAutoFallback') === true,
+      autocomplete: (() => {
+        const cfg = vscode.workspace.getConfiguration('localAI');
+        return cfg.get('autocomplete') === true ? String(cfg.get('autocompleteModel') || '').trim() || 'Auto' : 'Off';
+      })(),
+      embeddingModel: (() => {
+        const v = String(vscode.workspace.getConfiguration('localAI').get('embeddingModel') || '').trim();
+        return !v || v === 'auto' ? 'Auto' : v === 'off' ? 'Off' : v;
+      })(),
+      imageBackend: require('./imageGen').describe(this._context.globalState.get('localAI.imageGen', null)),
       voice: voice.info(),
       generation: generationLib.summary(),
       cloud: await this._cloudState(),
@@ -274,6 +295,7 @@ class SidebarProvider {
       ...common,
       installedModels: installed,
       recommendedModels: RECOMMENDED_MODELS,
+      ollamaCloudModels: require('./catalog').cloudModels,
       totalRamGB: require('os').totalmem() / (1024 * 1024 * 1024),
       hardware: this._hardwareState()
     });

@@ -9,6 +9,14 @@ Cloud models are strictly opt-in and clearly marked.
 
 ## Highlights
 
+**Fast where it can be, agent where it pays off**
+- **Work mode** (shown next to the model in the chat, Settings > Work mode): **Fast** for small or slow models: the model
+  gets the relevant files (a page together with its scripts and styles) and answers with complete files in one pass.
+  **Standard** for 7-13B: tools and a short plan with checkable items. **Agent** for strong cloud models and 14B+ models
+  that run fast: full tool loop with helper agents for big jobs. Auto picks from the model's size and its measured speed.
+- Small models answer without minutes of "thinking"; a model that thinks too long or in circles is asked again without it.
+- New buttons that no script uses, and files with a block pasted twice, are caught and sent back to the model.
+
 **Works on your project**
 - Reads, searches, creates and edits files in the open folder and shows the work as steps
   (*Creating index.html*, *Updating script.js*) with an expandable diff, **Open file** and **Open diff**.
@@ -18,14 +26,17 @@ Cloud models are strictly opt-in and clearly marked.
   Ask for a change later and it continues from the current file on disk, including your own edits.
 - **Autopilot**: give a task and walk away. It plans, works, checks the project, retries, and stops only when
   everything on its checklist is done. Dangerous commands (`sudo`, `git push`, destructive deletes) are blocked.
-- **Helper agents**: the main chat can start research and worker agents in parallel. Research helpers can run
-  on a small fast model. A badge shows how many agents ran and the tokens used.
+- **Helper agents**: for big jobs the main chat can start research and worker agents in parallel, each with a brief
+  (goal, known files, what is already known, the report it must return). They are slow, so they are offered only when
+  you ask for them or the project is large (60+ source files), at most 3 per request. Research helpers can run on a
+  small fast model. A badge shows how many agents ran and the tokens used.
 - It can **ask you** a clarifying question in a small dialog above the input.
 
 **Checks its own work**
 - When the AI finishes a task that changed files, quick checks run (syntax of the changed files, HTML ids, `onclick`
-  handlers, missing scripts). With a model that is big enough, a **reviewer agent** then reads the changes, runs the
-  project's tests when there are any, and answers PASS or FAIL. If something is wrong, the AI fixes it, up to two rounds
+  handlers, missing scripts, new errors in the Problems panel). For bigger changes (3+ files or 80+ changed lines, and
+  in autopilot) a **reviewer agent** then reads the changes, runs the project's tests when there are any, and answers
+  PASS or FAIL. If something is wrong, the AI fixes it, up to two rounds
   (`localAI.verifyChanges`).
 - **Undo all changes** restores every file the last request touched, also after VS Code was restarted.
 
@@ -50,8 +61,14 @@ Cloud models are strictly opt-in and clearly marked.
 
 **Free cloud models, when local ones are too weak**
 - Settings > Cloud providers (or **Connect a cloud provider** in the sidebar): pick Groq, OpenRouter, Google Gemini,
-  Mistral, Cerebras or any OpenAI-compatible service, create a free API key on their site, paste it, and tick the models
-  you want. The list comes straight from the provider's API, so it is never out of date.
+  Mistral, Cerebras, Hugging Face or NVIDIA, create a free API key on their site, paste it, and tick the models you want.
+  Paid providers (DeepSeek, OpenAI, Anthropic) are marked. The list comes straight from the provider's API, so it is never
+  out of date.
+- **Ollama Cloud**: very large models (Kimi K2.7 Code, GLM 5.3, DeepSeek V4...) through your own Ollama, no key: sign in
+  once from the sidebar. The free plan has a monthly allowance and runs one request at a time.
+- **Your own servers**: LM Studio, llama.cpp, Jan, vLLM or any OpenAI-compatible address, as many as you like, key optional.
+  Servers on this computer count as local.
+- **Switch model when a limit is hit** (off by default): the answer continues with your next cloud model at once.
 - Cloud models work everywhere a local one does: project tools, autopilot, helper agents, skills, files steps.
 - Your key is kept in VS Code's secret storage. Before the first cloud message you must accept a notice that your
   messages and the files the AI reads will be sent to that provider. The model chip shows a **cloud** badge and the
@@ -75,8 +92,27 @@ Cloud models are strictly opt-in and clearly marked.
 - **Pick the quantization** from the live Ollama list with exact sizes and context length.
 - **Fit for your computer**: Apple Silicon, NVIDIA or CPU is detected; every model and quantization is marked
   *fits well / tight / slow / too heavy*, with a recommended pick.
-- Response mode like LM Studio: Precise / Balanced / Creative / Custom, context length (4K to 128K), GPU or CPU.
+- Context length from 4K to 128K (never more than the model supports). Answers use low randomness, the most reliable
+  setting for code and tools, and the model stays loaded for 30 minutes between messages so answers start quickly.
 - Switching the model is announced in the chat.
+
+**More than chat**
+- **Code completion as you type**: grey suggestions from a small local model (for example `qwen2.5-coder:1.5b`), Tab to
+  accept. Off by default; toggle it in the status bar.
+- **Meaning search**: with a local embedding model (`nomic-embed-text`) the agent finds "where the login is handled"
+  without knowing the names (`semantic_search`). The index is built on this computer and updated as files change.
+- **Pictures for your project**: the agent saves illustrations and backgrounds with `generate_image` using Stable
+  Diffusion WebUI / Forge / Draw Things on this computer, Hugging Face, or an OpenAI-compatible images API. Choose it in
+  Settings > Image generation, or run **Generate Image**. Icons and logos are drawn as SVG.
+- **MCP servers**: tools from your own servers (`localAI.mcpServers`) and the project's `.mcp.json` (each one only after you
+  allow it). Every call that is not marked read-only asks first.
+- **Problems panel**: the agent reads errors from TypeScript, ESLint, Python and other language servers (`get_problems`),
+  and the checks after a change include the new ones.
+- **Web pages**: the agent can read documentation or an issue (`web_fetch`) after you approve each page.
+- **Edit a message** to try again: the chat goes back to that point and, if you want, the files too.
+- **Write Commit Message** (Source Control), **Fix Selected Terminal Error** (terminal menu), **Fix / Explain with Local
+  Full AI** (light bulb on an error), and **`@local`** in VS Code's own chat view.
+- **Reviewer model**: let a second, stronger model check the work. **Usage statistics** per model and day.
 
 **Your Claude skills, on every model**
 - Skills from `~/.claude/skills`, `<project>/.claude/skills` and your own folders are matched to each request
@@ -115,31 +151,38 @@ Most options are in the sidebar under **Settings**. The full list:
 | `localAI.ollamaBaseUrl` | http://localhost:11434 | Address of the local Ollama server |
 | `localAI.useClaudeSkills` | on | Load your Claude skills (~/.claude/skills and <project>/.claude/skills) and CLAUDE.md files into the chat. Use /skill-name in the chat or let the model pick one. |
 | `localAI.extraSkillFolders` | [] | Extra folders that contain skills (each skill is a subfolder with a SKILL.md). |
-| `localAI.responseMode` | precise | How the model answers. Precise (low temperature) is the most reliable for code and tool use. |
-| `localAI.temperature` | 0.2 | Randomness for the Custom response mode. |
-| `localAI.topP` | 0.9 | Nucleus sampling for the Custom response mode. |
-| `localAI.topK` | 40 | Top-K sampling for the Custom response mode. |
-| `localAI.repeatPenalty` | 1.05 | Repeat penalty for the Custom response mode. |
-| `localAI.gpuLayers` | -1 | How many model layers run on the GPU. -1 = automatic, 0 = CPU only. |
 | `localAI.folderAccess` | [] | Folders the AI may use and how far it may go in each. The deepest matching folder wins. Project folders default to full. |
 | `localAI.workingFolder` | (empty) | Folder the AI works from (relative paths and commands). Empty means the open project folder. |
 | `localAI.unloadModelsOnClose` | on | When VS Code closes, unload the models from RAM if Ollama was started by something other than this extension. A server started by this extension is stopped completely. |
 | `localAI.autoSkills` | on | Pick the skills that match each request and give them to the model directly, so skills work with every model (no tool calling needed). |
-| `localAI.cloudContextSize` | 12000 | How many tokens of chat and project context are sent to a cloud model. Free tiers have small per-minute token limits, so keep this modest. |
-| `localAI.multiAgent` | on | Let the main chat start helper agents (delegate_task) for research and sub-tasks. |
-| `localAI.subagentModel` | (empty) | Model for research helper agents. Empty = same as the chat, "auto" = the smallest installed model, or an exact model name. A small model is fast for simple reading tasks; helpers that edit files always use the chat model. |
+| `localAI.cloudContextSize` | 12000 | (Settings JSON only; lowered automatically from the provider's limits) How many tokens of chat and project context are sent to a cloud model. Free tiers have small per-minute token limits, so keep this modest. |
+| `localAI.agentMode` | auto | How the AI works: auto, direct (fast, one pass with complete files), standard (tools and a plan) or agent (tools and helper agents). |
+| `localAI.subagentModel` | (empty) | (Settings JSON only) Model for research helper agents. Empty = same as the chat, "auto" = the smallest installed model, or an exact model name. A small model is fast for simple reading tasks; helpers that edit files always use the chat model. |
 | `localAI.language` | auto | Language of the sidebar and chat interface: "auto" follows VS Code, "en" English, "uk" Ukrainian. Applies when the panel is opened again. Messages from VS Code itself (pickers, notifications) stay in English. |
 | `localAI.voiceEngine` | local | Speech recognition for voice input: "local" (offline whisper.cpp, nothing leaves the computer) or "groq" (Groq Whisper in the cloud: fast and accurate, needs the Groq key, the recording is sent to Groq). |
 | `localAI.voiceLanguage` | auto | Language for voice input (whisper language code such as en, uk, ru) or auto to detect. |
 | `localAI.whisperBinaryPath` | (empty) | Path to whisper-cli (whisper.cpp). Empty means search PATH and Homebrew. |
 | `localAI.whisperModelPath` | (empty) | Path to a whisper.cpp ggml model. Empty means ~/.local-full-ai/whisper/ggml-base.bin. |
-| `localAI.contextSize` | 16384 | Context window (tokens) requested from Ollama. Larger values remember more of the project but use more RAM. |
+| `localAI.contextSize` | 16384 | Context window (tokens) requested from Ollama. Larger values remember more of the project but use more RAM. Never more than the model supports. |
+| `localAI.thinking` | auto | Thinking for local reasoning models: auto, fast (little thinking) or deep. |
+| `localAI.autocomplete` | off | Code completion as you type with a small local model. |
+| `localAI.autocompleteModel` | (empty) | Model for code completion; empty = the smallest installed model that can fill in the middle. |
+| `localAI.embeddingModel` | (empty) | Local embedding model for meaning search; empty = auto, "off" = not used. |
+| `localAI.reviewerModel` | (empty) | Model of the reviewer agent; empty = the chat model. |
+| `localAI.cloudAutoFallback` | off | When a cloud model hits its limit, continue with your next cloud model instead of waiting. |
+| `localAI.webFetch` | on | Let the agent read public web pages after your approval. |
+| `localAI.mcp` | on | Use the tools of your MCP servers. |
+| `localAI.mcpServers` | {} | MCP servers in the Claude Code format (`command`/`args`/`env` or `type: "http"` + `url`); user settings only. |
 
 ## Commands
 
 - **Local Full AI: Select / Download Model** (`localAI.selectModel`)
 - **Local Full AI: Open Chat** (`localAI.openChat`)
 - **Local Full AI: Ask About Selected Code** (`localAI.askAboutSelection`)
+- **Local Full AI: Generate Image** (`localAI.generateImage`)
+- **Local Full AI: Write Commit Message** (`localAI.generateCommitMessage`), also a button in Source Control
+- **Local Full AI: Fix Selected Terminal Error** (`localAI.fixTerminalError`), also in the terminal's context menu
+- **Local Full AI: Turn Code Completion On/Off** (`localAI.toggleAutocomplete`), also in the status bar
 - **Local Full AI: Copy Diagnostics for a Bug Report** (`localAI.copyDiagnostics`): versions, settings and recent errors, with keys, chats and file contents left out
 
 ## Privacy and network
@@ -148,9 +191,17 @@ Most options are in the sidebar under **Settings**. The full list:
 - Only if you connect a cloud provider **and** select one of its models, your messages and the files the AI reads are sent
   to that provider. Free tiers of some providers may use prompts to improve their products. Do not use cloud models for
   private or sensitive code.
+- Ollama Cloud models (names ending in `cloud`) run on ollama.com: they get the same notice as other cloud models.
+- Picture generation sends the picture description to the backend you chose; Stable Diffusion WebUI on this computer keeps
+  it local. Code completion and meaning search only use your local Ollama.
+- MCP servers run with your permissions. Servers from a project's `.mcp.json` start only in a trusted folder and only after
+  you allow them; tools that are not marked read-only ask before every call.
+- `web_fetch` reads only public addresses (never your local network) and asks before every page.
 - Otherwise the extension talks to the network only to: download models (Ollama), load the list of quantization variants
-  from `ollama.com`, and, if you set up voice input, download a speech model from Hugging Face.
-- Chat history is stored in VS Code's local storage on your computer. Delete a chat from the chat list to remove it.
+  from `ollama.com`, refresh the recommended model lists from the project's GitHub repository, and, if you set up voice
+  input, download a speech model from Hugging Face.
+- Chat history is stored in the extension's storage folder on your computer (one file per chat). Delete a chat from the
+  chat list to remove it.
 - Commands the AI runs are executed in your project folder and always need your approval, except in Autopilot, where
   the blocklist applies. Use a folder under version control for Autopilot.
 
@@ -171,8 +222,10 @@ Most options are in the sidebar under **Settings**. The full list:
 - The fit estimate is approximate and the context memory is a rough guess.
 - Autopilot stops if VS Code is closed; it does not resume after a restart.
 - Windows and Linux are much less tested than macOS.
-- The reviewer agent is the same model as the chat: a weak model can miss its own mistakes. Very small models (4B and
-  below) only get the quick checks and do not start helper agents.
+- By default the reviewer agent is the same model as the chat, and a weak model can miss its own mistakes: pick a stronger
+  one in Settings > Reviewer model. Without one, very small models (4B and below) only get the quick checks and do not
+  start helper agents.
+- Ollama's own picture generation is not used yet: it has no documented API so far (macOS CLI only).
 - Voice transcription quality depends on the whisper model and your microphone.
 
 ## Troubleshooting

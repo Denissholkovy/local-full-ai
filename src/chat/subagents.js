@@ -1,9 +1,37 @@
+const consent = require('../consent');
+const agentTools = require('../agentTools');
+
+// Helpers are slow (each starts from an empty context), so one request may start only a few.
+const MAX_HELPERS = 3;
+const MAX_HELPERS_AUTOPILOT = 6;
+const fs = require('fs');
 const { vscode, truncate, cloud, CONTEXT_FILE_CHARS, CONTEXT_TOTAL_CHARS, SUBAGENT_MAX_STEPS, MAX_SUBAGENT_REPORT_CHARS, modelSupportsTools } = require('./common');
 
 // Methods mixed into ChatPanel.prototype (see chatPanel.js).
 module.exports = {
+  // A second model checks the work: a model rarely spots its own mistakes. Falls back to the chat model.
+  async _reviewerModel(parentModel) {
+    const configured = String(vscode.workspace.getConfiguration('localAI').get('reviewerModel') || '').trim();
+    if (!configured || configured === parentModel) return parentModel;
+    if (consent.destination(configured)) {
+      const id = consent.destination(configured).id;
+      if (!this._context.globalState.get(`localAI.cloudConsent.${id}`)) return parentModel;
+      if (cloud.isCloudModel(configured)) {
+        const known = this._context.globalState.get('localAI.cloudModels', []).some((m) => m.name === configured);
+        return known ? configured : parentModel;
+      }
+    }
+    try {
+      const installed = await this._installedModels();
+      return installed.some((m) => m.name === configured) || cloud.isCloudModel(configured) ? configured : parentModel;
+    } catch (_) {
+      return parentModel;
+    }
+  },
+
   async _chooseHelperModel(subMode, parentModel, session) {
-    if (subMode === 'worker' || subMode === 'verify') return parentModel;
+    if (subMode === 'verify') return this._reviewerModel(parentModel);
+    if (subMode === 'worker') return parentModel;
     const configured = String(vscode.workspace.getConfiguration('localAI').get('subagentModel') || '').trim();
     if (!configured) return parentModel;
     if (cloud.isCloudModel(configured)) {
@@ -20,6 +48,7 @@ module.exports = {
     if (configured === 'auto') {
       const parentSize = (installed.find((m) => m.name === parentModel) || { size: Infinity }).size;
       const candidates = installed.filter((m) => m.size > 0.5e9 && m.size < parentSize).sort((a, b) => a.size - b.size);
+      for (const m of candidates.slice(0, 4)) await this._ensureLocalCaps(m.name);
       const withTools = candidates.filter((m) => modelSupportsTools(m.name) && !this._noToolsModels.has(m.name));
       const pick = withTools[0] || candidates[0];
       return pick ? pick.name : parentModel;
@@ -36,7 +65,14 @@ module.exports = {
     const { tools } = ctx;
     if (!tools) return '';
     const task = (ctx.history[0] && ctx.history[0].content) || '';
-    let picks = tools.findFilesByName(task, 5);
+    const named = (ctx.briefFiles || []).filter((rel) => {
+      try {
+        return fs.statSync(tools.resolve(rel)).isFile();
+      } catch (_) {
+        return false;
+      }
+    });
+    let picks = [...new Set([...named, ...tools.findFilesByName(task, 5)])].slice(0, 6);
     if (picks.length === 0) picks = tools.listSourceFiles(5);
     let budget = CONTEXT_TOTAL_CHARS;
     const blocks = [];
@@ -57,7 +93,13 @@ module.exports = {
 
   async _runSubAgent(args, parentCtx, callId) {
     if (parentCtx.isSub) throw new Error('Helper agents cannot start other agents');
-    if (!args.task) throw new Error('"task" is required');
+    const problem = agentTools.briefProblem(args);
+    if (problem) throw new Error(problem);
+    if (args.mode !== 'verify') {
+      const limit = parentCtx.autopilot ? MAX_HELPERS_AUTOPILOT : MAX_HELPERS;
+      parentCtx.run.helpers = (parentCtx.run.helpers || 0) + 1;
+      if (parentCtx.run.helpers > limit) throw new Error(`No more helper agents for this request (limit ${limit}): do the rest yourself with the normal tools.`);
+    }
     const wantsWorker = args.mode === 'worker';
     if (wantsWorker && parentCtx.mode === 'readonly') {
       throw new Error('Read-only mode: only research helpers are allowed');
@@ -89,7 +131,8 @@ module.exports = {
       modelName: model,
       toolsEnabled: parentCtx.toolsEnabled && helperHasTools,
       reader,
-      history: [{ role: 'user', content: String(args.task) }],
+      briefFiles: Array.isArray(args.files) ? args.files.map(String) : [],
+      history: [{ role: 'user', content: args.goal ? agentTools.formatBrief(args) : String(args.task) }],
       label: `[${title}] `,
       ui: false,
       maxSteps: parentCtx.compact ? Math.min(SUBAGENT_MAX_STEPS[subMode], 8) : SUBAGENT_MAX_STEPS[subMode],

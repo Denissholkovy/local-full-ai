@@ -124,6 +124,8 @@
 
   function splitThinking(raw) {
     let visible = raw.replace(/<think>[\s\S]*?<\/think>/g, '');
+    const lone = visible.indexOf('</think>');
+    if (lone !== -1) visible = visible.slice(lone + '</think>'.length);
     const open = visible.indexOf('<think>');
     let thinking = false;
     if (open !== -1) {
@@ -324,10 +326,12 @@
             const original = btn.innerHTML;
             btn.innerHTML = icon('check');
             setTimeout(() => (btn.innerHTML = original), 1200);
-          } else {
+          } else if (isGenerating) {
             input.value = text;
             autoResize();
             input.focus();
+          } else {
+            post({ type: 'editMessage', ordinal: Array.from(messagesEl.querySelectorAll('.row.user')).indexOf(row) });
           }
         });
       });
@@ -419,7 +423,7 @@
 
   const PAST_TENSE = [
     ['Creating ', 'Created '], ['Updating ', 'Updated '], ['Editing ', 'Edited '], ['Reading ', 'Read '],
-    ['Listing ', 'Listed '], ['Searching ', 'Searched '], ['Running ', 'Ran ']
+    ['Listing ', 'Listed '], ['Searching ', 'Searched '], ['Running ', 'Ran '], ['Drawing ', 'Drew ']
   ];
 
   function finishToolCard(card, ok, denied, output, diff, diffMeta) {
@@ -512,6 +516,8 @@
       add('add', '+ ', preview.head);
     } else if (preview.kind === 'command') {
       add('ctx', '$ ', preview.command);
+    } else if (preview.kind === 'mcp') {
+      add('ctx', '', preview.args);
     }
     return box;
   }
@@ -551,9 +557,10 @@
       return (d.options || []).map((label) => ({ label, decision: 'answer', extra: label }));
     }
     const isCommand = d.permission === 'command';
+    const isMcp = /^mcp:/.test(d.permission || '');
     return [
       { label: 'Yes', decision: 'allow' },
-      { label: isCommand ? "Yes, and don't ask again for commands in this chat" : "Yes, and don't ask again for edits in this chat", decision: 'always' },
+      { label: d.permission === 'web' ? "Yes, and don't ask again for web pages in this chat" : isMcp ? "Yes, and don't ask again for this server in this chat" : isCommand ? "Yes, and don't ask again for commands in this chat" : "Yes, and don't ask again for edits in this chat", decision: 'always' },
       { label: 'No', decision: 'deny' }
     ];
   }
@@ -593,6 +600,10 @@
       ? d.question
       : d.permission === 'command'
         ? 'Run this command?'
+        : d.permission === 'web'
+          ? 'Read this web page?'
+          : /^mcp:/.test(d.permission || '')
+          ? 'Use the MCP tool ' + (d.label || '') + '?'
         : preview.kind === 'file' && !preview.exists
           ? 'Create this file?'
           : 'Apply this change?';
@@ -894,7 +905,7 @@
       items.push({
         label: 'Open ' + name + ' limits page',
         desc: 'Official numbers for your account',
-        onClick: () => post({ type: 'openCloudLimits', providerId: (cloudLimits && cloudLimits.providerId) || '' })
+        onClick: () => post({ type: 'openCloudLimits', providerId: (cloudLimits && cloudLimits.providerId) || info.cloudProviderId || '' })
       });
     }
     openMenu(limitsBtn, items);
@@ -1087,9 +1098,11 @@
   function applyInfo() {
     if (info.modelName) {
       const isCloud = !!info.cloudProvider;
-      const shown = isCloud ? info.modelName.split(':').slice(2).join(':') : info.modelName;
+      const shown = info.modelName.startsWith('cloud:') ? info.modelName.split(':').slice(2).join(':') : info.modelName;
+      const modeNames = { direct: 'fast', standard: 'standard', agent: 'agent' };
       modelChip.innerHTML = icon('box') + '<span>' + escapeHtml(shown) + '</span>' +
-        (isCloud ? '<span class="cloud-pill">cloud</span>' : '');
+        (isCloud ? '<span class="cloud-pill">cloud</span>' : '') +
+        (info.workMode ? '<span class="mode-pill mode-' + info.workMode + '" title="How the AI works with this model (Settings > Work mode)">' + modeNames[info.workMode] + '</span>' : '');
       modelChip.className = 'pill' + (isCloud ? ' is-cloud' : '');
       modelChip.title = isCloud
         ? shown + ' - cloud model: your messages and the files it reads are sent to ' + info.cloudProvider + '. Click to change the model.'
@@ -1520,6 +1533,20 @@
       case 'toolQuestion':
         enqueueDialog(msg);
         break;
+      case 'imagePreview': {
+        const card = toolCards[msg.id];
+        if (!card || !/^data:image\/(png|jpeg|webp);base64,/.test(msg.dataUrl || '')) break;
+        const figure = document.createElement('div');
+        figure.className = 'gen-image';
+        const img = document.createElement('img');
+        img.src = msg.dataUrl;
+        img.alt = msg.path;
+        img.title = 'Open ' + msg.path;
+        img.onclick = () => post({ type: 'openFile', path: msg.path });
+        figure.appendChild(img);
+        card.appendChild(figure);
+        break;
+      }
       case 'toolResult':
         setActivity('Thinking');
         removeDialog(msg.id);

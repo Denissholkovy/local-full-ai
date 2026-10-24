@@ -13,3 +13,4 @@ package-lock.json
 !CHANGELOG.md
 !LICENSE
 .github/**
+test/**

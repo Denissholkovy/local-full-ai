@@ -1,0 +1,7 @@
+[
+  { "name": "kimi-k2.7-code:cloud", "label": "Kimi K2.7 Code", "description": "Agentic coder, sees screenshots, 256K context", "category": "code", "tags": ["tools", "vision", "thinking"], "recommended": true },
+  { "name": "glm-5.3:cloud", "label": "GLM 5.3", "description": "Strong at code and tools, 1M context", "category": "code", "tags": ["tools", "thinking"] },
+  { "name": "deepseek-v4-pro:cloud", "label": "DeepSeek V4 Pro", "description": "Large all-rounder for hard problems, 1M context", "category": "general", "tags": ["tools", "thinking"] },
+  { "name": "deepseek-v4.1-flash:cloud", "label": "DeepSeek V4.1 Flash", "description": "Fast, sees images, 1M context", "category": "general", "tags": ["tools", "vision", "thinking"], "recommended": true },
+  { "name": "minimax-m3:cloud", "label": "MiniMax M3", "description": "Fast agent model, sees images, 512K context", "category": "general", "tags": ["tools", "vision", "thinking"] }
+]

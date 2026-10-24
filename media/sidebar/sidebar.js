@@ -86,7 +86,7 @@
   function cloudSectionHtml() {
     const c = state.cloud;
     if (!c) return '';
-    let html = '<h3>Cloud models (free) <span class="count">' + c.models.length + '</span></h3>';
+    let html = '<h3>Cloud models <span class="count">' + c.models.length + '</span></h3>';
     if (c.models.length === 0) {
       html += '<div class="cloud-intro">Local models too weak or slow? Connect a free cloud provider (Groq, OpenRouter, Google Gemini and others) with your own free API key. Your prompts then leave this computer. Local models stay the default.</div>';
     } else {
@@ -114,14 +114,14 @@
 
   function providerCardHtml(p, hasModels) {
     let html = '<div class="access-row prov on">' +
-      '<div class="access-head"><span class="access-name">' + esc(p.name) + '</span><span class="tag ok">connected</span></div>' +
+      '<div class="access-head"><span class="access-name">' + esc(p.name) + '</span><span class="tag ok">' + (p.local ? 'this computer' : p.server ? 'server' : 'connected') + '</span></div>' +
       '<div class="prov-note">' + esc(p.note) + '</div>' +
       limitsHtml(p) +
       '<div class="access-ctl cloud-ctl">' +
         '<button class="mini-btn" data-act="cloudPickModels" data-provider="' + p.id + '">' + (hasModels ? 'Change models' : 'Choose models') + '</button>' +
         (p.canCheck ? '<button class="mini-btn" data-act="cloudCheckLimits" data-provider="' + p.id + '" title="Ask the provider how much credit and quota is left">Check limits</button>' : '') +
-        '<button class="mini-btn" data-act="cloudSetKey" data-provider="' + p.id + '">Change key</button>' +
-        '<button class="icon-btn" data-act="cloudRemoveKey" data-provider="' + p.id + '" title="Disconnect: remove the key and its models">' + icon('trash') + '</button>' +
+        '<button class="mini-btn" data-act="cloudSetKey" data-provider="' + p.id + '">' + (p.server ? 'API key' : 'Change key') + '</button>' +
+        '<button class="icon-btn" data-act="cloudRemoveKey" data-provider="' + p.id + '" title="' + (p.server ? 'Remove this server and its models' : 'Disconnect: remove the key and its models') + '">' + icon('trash') + '</button>' +
       '</div>';
     if (p.hasLimits) {
       html += '<a class="prov-link" href="#" data-act="cloudOpenPage" data-provider="' + p.id + '" data-which="limits">Free-tier limits of ' + esc(p.name) + ' &#8599;</a>';
@@ -131,10 +131,10 @@
 
   function providerRowHtml(p) {
     return '<div class="prov-row">' +
-      '<div class="prov-row-main"><span class="access-name">' + esc(p.name) + '</span><div class="prov-note">' + esc(p.note) + '</div></div>' +
+      '<div class="prov-row-main"><span class="access-name">' + esc(p.name) + '</span>' + (p.paid ? ' <span class="tag warn">paid</span>' : '') + '<div class="prov-note">' + esc(p.note) + '</div></div>' +
       '<div class="prov-row-actions">' +
         '<button class="mini-btn primary" data-act="cloudSetKey" data-provider="' + p.id + '">Connect</button>' +
-        (p.hasKeyPage ? '<a class="prov-link" href="#" data-act="cloudOpenPage" data-provider="' + p.id + '" data-which="key">Get free key &#8599;</a>' : '') +
+        (p.hasKeyPage ? '<a class="prov-link" href="#" data-act="cloudOpenPage" data-provider="' + p.id + '" data-which="key">' + (p.paid ? 'Get API key' : 'Get free key') + ' &#8599;</a>' : '') +
       '</div>' +
     '</div>';
   }
@@ -161,6 +161,7 @@
 
   function bindCloud() {
     bind('[data-act="cloudConnect"]', () => send('cloudConnect'));
+    bind('[data-act="ollamaSignin"]', () => send('ollamaSignin'));
     bind('[data-act="cloudRemoveModel"]', (el, e) => { e.stopPropagation(); send('cloudRemoveModel', { name: el.getAttribute('data-model') }); });
     bind('[data-act="cloudSetKey"]', (el) => send('cloudSetKey', { providerId: el.getAttribute('data-provider') }));
     bind('[data-act="cloudPickModels"]', (el) => send('cloudPickModels', { providerId: el.getAttribute('data-provider') }));
@@ -202,22 +203,33 @@
     return '<div class="card-meta">' + parts.join('') + '</div>';
   }
 
+  function isOllamaCloud(name) {
+    return /:([\w.-]+-)?cloud$/i.test(name) && !/^cloud:/.test(name);
+  }
+
   function installedRow(m) {
     const isActive = state.selectedModel === m.name;
-    const catalog = state.catalog.find((c) => c.name === m.name);
+    const online = isOllamaCloud(m.name);
+    const embedder = /embed/i.test(m.name);
+    const catalog = state.catalog.find((c) => c.name === m.name) || (state.ollamaCloud || []).find((c) => c.name === m.name);
     const title = catalog ? catalog.label : m.name;
+    const meta = online
+      ? metaHtml('', (catalog && catalog.tags) || [], '<span class="tag cloud-tag" title="Runs on ollama.com: your prompts leave this computer">cloud</span>')
+      : embedder
+        ? metaHtml(formatSize(m.sizeGB), [], '<span class="tag" title="Used for meaning search in the project, not for chatting">search model</span>')
+        : metaHtml(formatSize(m.sizeGB), [].concat(m.quant ? [m.quant] : [], (catalog && catalog.tags) || []), agentTag(m.sizeGB, catalog ? (catalog.tags || []).includes('tools') : undefined));
     return '<div class="model-card' + (isActive ? ' active' : '') + '">' +
       '<div class="card-main">' +
         '<div class="card-title"><span class="model-name" title="' + esc(m.name) + '">' + esc(title) + '</span></div>' +
-        metaHtml(formatSize(m.sizeGB), [].concat(m.quant ? [m.quant] : [], (catalog && catalog.tags) || []), agentTag(m.sizeGB, catalog ? (catalog.tags || []).includes('tools') : undefined)) +
+        meta +
         '<div class="card-desc">' + esc(m.name) + '</div>' +
       '</div>' +
       '<div class="card-actions">' +
         (isActive
           ? '<span class="badge">Active</span>'
-          : '<button class="mini-btn" data-act="use" data-model="' + esc(m.name) + '">Use</button>') +
-        '<button class="icon-btn" data-act="variants" data-model="' + esc(m.name) + '" title="Other quantizations of this model">' + icon('sliders') + '</button>' +
-        '<button class="icon-btn" data-act="delete" data-model="' + esc(m.name) + '" title="Delete model">' + icon('trash') + '</button>' +
+          : embedder ? '' : '<button class="mini-btn" data-act="use" data-model="' + esc(m.name) + '">Use</button>') +
+        (online ? '' : '<button class="icon-btn" data-act="variants" data-model="' + esc(m.name) + '" title="Other quantizations of this model">' + icon('sliders') + '</button>') +
+        '<button class="icon-btn" data-act="delete" data-model="' + esc(m.name) + '" title="' + (online ? 'Remove from the model list' : 'Delete model') + '">' + icon('trash') + '</button>' +
       '</div>' +
     '</div>';
   }
@@ -525,9 +537,39 @@
     return html;
   }
 
+  function ollamaCloudRow(m) {
+    const installedNames = new Set((Array.isArray(state.installed) ? state.installed : []).map((x) => x.name));
+    const isActive = state.selectedModel === m.name;
+    const pull = pulls[m.name];
+    const action = isActive
+      ? '<span class="badge">Active</span>'
+      : installedNames.has(m.name)
+        ? '<button class="mini-btn" data-act="use" data-model="' + esc(m.name) + '">Use</button>'
+        : '<button class="mini-btn" data-act="install" data-model="' + esc(m.name) + '"' + (pull && !pull.done ? ' disabled' : '') + '>Add</button>';
+    return '<div class="model-card' + (isActive ? ' active' : '') + '">' +
+      '<div class="card-main">' +
+        '<div class="card-title"><span class="model-name" title="' + esc(m.name) + '">' + esc(m.label) + '</span>' +
+          (m.recommended ? '<span class="star" title="Recommended">&#9733;</span>' : '') + '</div>' +
+        metaHtml('', m.tags, '') +
+        '<div class="card-desc">' + esc(m.description || '') + '</div>' +
+      '</div>' +
+      '<div class="card-actions">' + action + '</div>' +
+    '</div>';
+  }
+
+  function ollamaCloudHtml() {
+    if (state.view !== 'ready' || !(state.ollamaCloud || []).length) return '';
+    let html = '<h3>Ollama Cloud</h3>';
+    html += '<div class="panel-note cloud">Very large models that run on ollama.com through your Ollama, with no API key: sign in once with a free account. The free plan has a monthly allowance and runs one request at a time.</div>';
+    state.ollamaCloud.forEach((m) => { html += ollamaCloudRow(m); });
+    html += '<button class="btn" data-act="ollamaSignin">' + icon('terminal') + ' Sign in to Ollama...</button>';
+    return html;
+  }
+
   function cloudPanelHtml() {
     let html = '<div class="panel-note cloud">Models that run online at a provider with its own free tier. They are stronger but your messages leave this computer, and free limits apply.</div>';
     html += cloudSectionHtml();
+    html += ollamaCloudHtml();
     html += '<h3>Providers</h3>' + cloudDetailsHtml();
     return html;
   }
@@ -545,9 +587,11 @@
     html += '<div class="settings-group"><span class="scope-tag both">Both</span> work with any model</div>';
     html += '<div class="settings-box">';
     html += scopeRow('System prompt', prompt, 'systemPrompt');
-    html += scopeRow('Response mode', g.modeLabel || '', 'responseMode');
-    html += scopeRow('Send active file as context', state.includeActiveFile ? 'On' : 'Off', 'activeFile');
-    html += scopeRow('Helper agents model', g.helperLabel || '', 'helperModel');
+    html += scopeRow('Work mode', g.agentModeLabel || 'Auto', 'agentMode');
+    html += scopeRow('Reviewer model', g.reviewerLabel || '', 'reviewerModel');
+    html += scopeRow('Image generation', state.imageBackend || 'Off', 'imageBackend');
+    html += scopeRow('MCP servers', 'Manage...', 'manageMcp');
+    html += scopeRow('Usage statistics', 'Show...', 'usageStats');
     html += '<button class="setting" data-act="toggleFoldersOpen"><span>Folder access</span><span class="value">' + esc(foldersSummary()) + ' ' + (foldersOpen ? '&#9652;' : '&#9662;') + '</span></button>';
     html += '<button class="setting" data-act="toggleSkillsOpen"><span>Claude skills</span><span class="value">' + esc(skillsSummary()) + ' ' + (skillsOpen ? '&#9652;' : '&#9662;') + '</span></button>';
     html += '<button class="setting" data-act="toggleVoiceOpen"><span>Voice input</span><span class="value">' + esc(voiceSummary()) + ' ' + (voiceOpen ? '&#9652;' : '&#9662;') + '</span></button>';
@@ -559,13 +603,14 @@
     html += '<div class="settings-group"><span class="scope-tag local">Local</span> only models on this computer</div>';
     html += '<div class="settings-box">';
     html += scopeRow('Context length', g.contextLabel || '', 'contextLength');
-    html += scopeRow('Run on', g.gpuLabel || '', 'gpuMode');
-    html += scopeRow('Keep model in RAM', state.keepAlive || '5m (default)', 'keepAlive');
+    html += scopeRow('Thinking', g.thinkingLabel || '', 'thinking');
+    html += scopeRow('Code completion', state.autocomplete || 'Off', 'autocomplete');
+    html += scopeRow('Meaning search', state.embeddingModel || 'Auto', 'embeddingModel');
     html += '</div>';
 
     html += '<div class="settings-group"><span class="scope-tag cloud">Cloud</span> only online models</div>';
     html += '<div class="settings-box">';
-    html += scopeRow('Cloud context size', g.cloudContextLabel || '', 'cloudContext');
+    html += scopeRow('Switch model when a limit is hit', state.cloudAutoFallback ? 'On' : 'Off', 'cloudFallback');
     html += '</div>';
     return html;
   }
@@ -575,8 +620,6 @@
     bind('[data-act="mainTab"]', (el) => { mainTab = el.getAttribute('data-tab'); render(); });
     bind('[data-act="toggleSettings"]', () => { settingsOpen = !settingsOpen; render(); });
     bind('[data-act="systemPrompt"]', () => send('editSystemPrompt'));
-    bind('[data-act="keepAlive"]', () => send('editKeepAlive'));
-    bind('[data-act="activeFile"]', () => send('toggleIncludeActiveFile'));
     bind('[data-act="tab"]', (el) => { activeTab = el.getAttribute('data-tab'); render(); });
     bind('[data-act="install"]', (el) => send('installModel', { modelName: el.getAttribute('data-model') }));
     bind('[data-act="use"]', (el) => send('selectInstalledModel', { modelName: el.getAttribute('data-model') }));
@@ -586,11 +629,16 @@
     });
     bind('[data-act="cancelPull"]', (el, e) => { e.stopPropagation(); if (pulls[el.getAttribute('data-model')]) pulls[el.getAttribute('data-model')].stopping = true; render(); send('cancelPull', { modelName: el.getAttribute('data-model') }); });
     bind('[data-act="variants"]', (el, e) => { e.stopPropagation(); send('chooseVariant', { modelName: el.getAttribute('data-model') }); });
-    bind('[data-act="responseMode"]', () => send('chooseResponseMode'));
+    bind('[data-act="agentMode"]', () => send('chooseAgentMode'));
     bind('[data-act="contextLength"]', () => send('chooseContext'));
-    bind('[data-act="cloudContext"]', () => send('chooseCloudContext'));
-    bind('[data-act="gpuMode"]', () => send('chooseGpu'));
-    bind('[data-act="helperModel"]', () => send('chooseHelperModel'));
+    bind('[data-act="thinking"]', () => send('chooseThinking'));
+    bind('[data-act="autocomplete"]', () => send('chooseAutocomplete'));
+    bind('[data-act="embeddingModel"]', () => send('chooseEmbeddingModel'));
+    bind('[data-act="cloudFallback"]', () => send('toggleCloudFallback'));
+    bind('[data-act="imageBackend"]', () => send('chooseImageBackend'));
+    bind('[data-act="manageMcp"]', () => send('manageMcp'));
+    bind('[data-act="reviewerModel"]', () => send('chooseReviewerModel'));
+    bind('[data-act="usageStats"]', () => send('showUsageStats'));
     bindCloud();
     bind('[data-act="toggleFoldersOpen"]', () => { foldersOpen = !foldersOpen; render(); });
     bind('[data-act="addFolder"]', () => send('addAccessFolder'));
@@ -661,10 +709,13 @@
           installed: ready ? msg.installedModels : !!msg.installed,
           binary: msg.binary,
           catalog: ready ? msg.recommendedModels : [],
+          ollamaCloud: ready ? msg.ollamaCloudModels || [] : [],
           selectedModel: msg.selectedModel || null,
           systemPrompt: msg.systemPrompt || '',
-          keepAlive: msg.keepAlive || '',
-          includeActiveFile: !!msg.includeActiveFile,
+          cloudAutoFallback: !!msg.cloudAutoFallback,
+          imageBackend: msg.imageBackend || 'Off',
+          autocomplete: msg.autocomplete || 'Off',
+          embeddingModel: msg.embeddingModel || 'Auto',
           totalRamGB: msg.totalRamGB || 0,
           cloud: msg.cloud || null,
           generation: msg.generation || null,

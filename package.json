@@ -39,6 +39,15 @@
   "activationEvents": [],
   "main": "./src/extension.js",
   "contributes": {
+    "chatParticipants": [
+      {
+        "id": "localAI.chat",
+        "name": "local",
+        "fullName": "Local Full AI",
+        "description": "Ask the model you picked in the Local Full AI sidebar",
+        "isSticky": true
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -71,11 +80,51 @@
         "title": "Local Full AI: Ask About Selected Code"
       },
       {
+        "command": "localAI.generateCommitMessage",
+        "title": "Local Full AI: Write Commit Message",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "localAI.fixTerminalError",
+        "title": "Local Full AI: Fix Selected Terminal Error"
+      },
+      {
+        "command": "localAI.toggleAutocomplete",
+        "title": "Local Full AI: Turn Code Completion On/Off"
+      },
+      {
+        "command": "localAI.generateImage",
+        "title": "Local Full AI: Generate Image"
+      },
+      {
+        "command": "localAI.fixWithAI",
+        "title": "Local Full AI: Fix With AI"
+      },
+      {
         "command": "localAI.copyDiagnostics",
         "title": "Local Full AI: Copy Diagnostics for a Bug Report"
       }
     ],
     "menus": {
+      "scm/title": [
+        {
+          "command": "localAI.generateCommitMessage",
+          "when": "scmProvider == git",
+          "group": "navigation"
+        }
+      ],
+      "terminal/context": [
+        {
+          "command": "localAI.fixTerminalError",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "localAI.fixWithAI",
+          "when": "false"
+        }
+      ],
       "editor/context": [
         {
           "command": "localAI.askAboutSelection",
@@ -105,48 +154,51 @@
           "default": [],
           "description": "Extra folders that contain skills (each skill is a subfolder with a SKILL.md)."
         },
-        "localAI.responseMode": {
+        "localAI.autocomplete": {
+          "type": "boolean",
+          "default": false,
+          "description": "Suggest code as you type (grey text, Tab to accept) with a small local model. Runs only on this computer through Ollama."
+        },
+        "localAI.autocompleteModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model for code completion. Empty or \"auto\" = the smallest installed model that can fill in the middle (for example qwen2.5-coder:1.5b)."
+        },
+        "localAI.embeddingModel": {
+          "type": "string",
+          "default": "",
+          "description": "Local embedding model for meaning search in the project (semantic_search). Empty or \"auto\" = the smallest installed embedding model (for example nomic-embed-text), \"off\" = do not use it."
+        },
+        "localAI.webFetch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Let the AI read public web pages (documentation, issues). You approve every page; autopilot never uses it."
+        },
+        "localAI.mcp": {
+          "type": "boolean",
+          "default": true,
+          "description": "Give the AI the tools of your MCP servers (localAI.mcpServers and, after you allow each one, the project's .mcp.json)."
+        },
+        "localAI.mcpServers": {
+          "type": "object",
+          "scope": "application",
+          "default": {},
+          "description": "MCP servers in the Claude Code format: { \"name\": { \"command\": \"npx\", \"args\": [\"-y\", \"some-mcp-server\"], \"env\": {} } } or { \"name\": { \"type\": \"http\", \"url\": \"https://...\", \"headers\": {} } }. Add \"autoApprove\": true to let autopilot use a server without asking."
+        },
+        "localAI.thinking": {
           "type": "string",
           "enum": [
-            "precise",
-            "balanced",
-            "creative",
-            "custom"
+            "auto",
+            "fast",
+            "deep"
           ],
-          "default": "precise",
-          "description": "How the model answers. Precise (low temperature) is the most reliable for code and tool use."
-        },
-        "localAI.temperature": {
-          "type": "number",
-          "default": 0.2,
-          "minimum": 0,
-          "maximum": 2,
-          "description": "Randomness for the Custom response mode."
-        },
-        "localAI.topP": {
-          "type": "number",
-          "default": 0.9,
-          "minimum": 0,
-          "maximum": 1,
-          "description": "Nucleus sampling for the Custom response mode."
-        },
-        "localAI.topK": {
-          "type": "number",
-          "default": 40,
-          "minimum": 0,
-          "description": "Top-K sampling for the Custom response mode."
-        },
-        "localAI.repeatPenalty": {
-          "type": "number",
-          "default": 1.05,
-          "minimum": 0.5,
-          "maximum": 2,
-          "description": "Repeat penalty for the Custom response mode."
-        },
-        "localAI.gpuLayers": {
-          "type": "number",
-          "default": -1,
-          "description": "How many model layers run on the GPU. -1 = automatic, 0 = CPU only."
+          "enumDescriptions": [
+            "Small local models (under 13B) answer without thinking, bigger ones use their default",
+            "Think as little as possible: much faster answers for simple tasks",
+            "Think longer: slower, but better for hard bugs and planning"
+          ],
+          "default": "auto",
+          "description": "Thinking for local models that can reason before answering (Qwen3, GPT-OSS, DeepSeek-R1...). Other models ignore it."
         },
         "localAI.folderAccess": {
           "type": "array",
@@ -197,15 +249,37 @@
           "minimum": 2048,
           "description": "How many tokens of chat and project context are sent to a cloud model. Free tiers have small per-minute token limits, so keep this modest."
         },
-        "localAI.multiAgent": {
+        "localAI.cloudAutoFallback": {
           "type": "boolean",
-          "default": true,
-          "description": "Let the main chat start helper agents (delegate_task) for research and sub-tasks."
+          "default": false,
+          "description": "When a cloud model hits its limit or its provider is overloaded, continue right away with your next cloud model instead of waiting. Never switches from a local model to a cloud one."
+        },
+        "localAI.agentMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "direct",
+            "standard",
+            "agent"
+          ],
+          "enumDescriptions": [
+            "Pick from the model's size and measured speed: fast for small or slow models, agent for strong and fast ones",
+            "Fast: the model gets the relevant files and answers with complete files in one pass (best for 4B and slow models)",
+            "Standard: tool loop with a short plan, no helper agents (7-13B)",
+            "Agent: full tool loop with helper agents for big jobs (strong cloud models, 14B+ that run fast)"
+          ],
+          "default": "auto",
+          "description": "How the AI works on your project. Auto picks from the model's size and its measured speed on this computer."
         },
         "localAI.subagentModel": {
           "type": "string",
           "default": "",
           "description": "Model for research helper agents. Empty = same as the chat, \"auto\" = the smallest installed model, or an exact model name. A small model is fast for simple reading tasks; helpers that edit files always use the chat model."
+        },
+        "localAI.reviewerModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model of the reviewer agent that checks the AI's changes. Empty = the chat model. A different, stronger model finds more mistakes (local name, or a cloud model such as cloud:groq:llama-3.3-70b-versatile)."
         },
         "localAI.verifyChanges": {
           "type": "string",
@@ -215,8 +289,8 @@
             "off"
           ],
           "enumDescriptions": [
-            "After the AI changes files: quick checks (syntax, broken links) always, plus a reviewer agent when the model is big enough and the cloud limits allow it",
-            "Always add the reviewer agent, also for cloud models with small free limits",
+            "After the AI changes files: quick checks (syntax, broken links, new errors in the Problems panel) always, plus a reviewer agent for bigger changes (3+ files or 80+ changed lines, or autopilot) when the model is big enough and the cloud limits allow it",
+            "Always add the reviewer agent, also for small changes and for cloud models with small free limits",
             "Do not check the changes"
           ],
           "default": "auto",
@@ -269,17 +343,13 @@
           "default": 16384,
           "minimum": 2048,
           "description": "Context window (tokens) requested from Ollama. Larger values remember more of the project but use more RAM."
-        },
-        "localAI.selectedModel": {
-          "type": "string",
-          "default": "",
-          "description": "Currently selected model (filled in automatically via 'Select Model')"
         }
       }
     }
   },
   "scripts": {
     "lint": "echo \"(no lint configured)\"",
+    "test": "node --test test/",
     "package": "vsce package --no-dependencies",
     "release:patch": "npm version patch -m \"Release %s\" && git push --follow-tags",
     "release:minor": "npm version minor -m \"Release %s\" && git push --follow-tags"

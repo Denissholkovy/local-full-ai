@@ -1,38 +1,234 @@
 const { vscode, voice, generationLib, cloud } = require('./common');
+const imageGen = require('../imageGen');
+const capabilities = require('../modelCapabilities');
 
 // Methods mixed into SidebarProvider.prototype (see sidebarProvider.js).
 module.exports = {
-  async _chooseResponseMode() {
-    const config = vscode.workspace.getConfiguration('localAI');
-    const current = generationLib.currentMode();
-    const items = [
-      ...Object.entries(generationLib.PRESETS).map(([id, p]) => ({
-        label: `${id === current ? '$(check) ' : ''}${p.label}`,
-        description: `temperature ${p.temperature}`,
-        detail: p.description,
-        mode: id
-      })),
-      { label: `${current === 'custom' ? '$(check) ' : ''}Custom...`, description: 'set temperature, top-p, top-k and repeat penalty yourself', mode: 'custom' }
-    ];
-    const picked = await vscode.window.showQuickPick(items, { title: 'How should the model answer?' });
+  async _chooseImageBackend() {
+    const current = this._context.globalState.get('localAI.imageGen', null);
+    const providers = (await this._cloudState()).providers.filter((p) => p.hasKey && !['groq', 'cerebras', 'openrouter', 'mistral', 'anthropic', 'custom'].includes(p.id));
+    const picked = await vscode.window.showQuickPick(
+      [
+        { label: 'Off', description: imageGen.isConfigured(current) ? '' : 'current', detail: 'The AI draws icons as SVG files but makes no pictures.', kind: 'off' },
+        { label: 'Stable Diffusion WebUI / Forge / Draw Things', description: 'on this computer', detail: 'Free and private. Start the app with its API enabled (WebUI: --api; Draw Things: HTTP server on).', kind: 'sdwebui' },
+        { label: 'Hugging Face', description: providers.some((p) => p.id === 'huggingface') ? 'token saved' : 'connect it under Cloud models first', detail: 'Text-to-image models such as Stable Diffusion 3 and FLUX, paid from your Hugging Face credits.', kind: 'huggingface' },
+        ...providers.filter((p) => p.id !== 'huggingface').map((p) => ({
+          label: p.name,
+          description: p.local ? 'on this computer' : 'cloud',
+          detail: 'Uses its OpenAI-compatible /images/generations endpoint (OpenAI, Gemini, LocalAI and similar). Usually paid.',
+          kind: 'openai',
+          provider: p
+        }))
+      ],
+      { title: 'Image generation: where should pictures be made?', placeHolder: `Now: ${imageGen.describe(current)}` }
+    );
     if (!picked) return;
-    if (picked.mode === 'custom') {
-      const ask = async (prompt, key, fallback, min, max) => {
-        const value = await vscode.window.showInputBox({
-          prompt,
-          value: String(config.get(key) ?? fallback),
-          validateInput: (v) => (Number.isFinite(Number(v)) && Number(v) >= min && Number(v) <= max ? null : `Enter a number from ${min} to ${max}`)
-        });
-        if (value === undefined) return false;
-        await config.update(key, Number(value), vscode.ConfigurationTarget.Global);
-        return true;
-      };
-      if (!(await ask('Temperature (0 = exact, 1 = varied)', 'temperature', 0.2, 0, 2))) return;
-      if (!(await ask('Top-p (0.1 - 1)', 'topP', 0.9, 0.05, 1))) return;
-      if (!(await ask('Top-k (0 = off)', 'topK', 40, 0, 1000))) return;
-      if (!(await ask('Repeat penalty (1 = off)', 'repeatPenalty', 1.05, 0.5, 2))) return;
+    let config = null;
+    if (picked.kind === 'sdwebui') {
+      const url = await vscode.window.showInputBox({
+        prompt: 'Address of the Stable Diffusion WebUI API',
+        value: (current && current.kind === 'sdwebui' && current.url) || imageGen.DEFAULT_SDWEBUI_URL,
+        validateInput: (v) => (/^https?:\/\/\S+$/.test(v.trim()) ? null : 'Enter a full address starting with http:// or https://')
+      });
+      if (!url) return;
+      config = { kind: 'sdwebui', url: url.trim().replace(/\/+$/, '') };
+    } else if (picked.kind === 'huggingface') {
+      if (!providers.some((p) => p.id === 'huggingface')) {
+        vscode.window.showWarningMessage('Connect Hugging Face under Cloud models first, then choose it here.');
+        return;
+      }
+      const model = await vscode.window.showInputBox({
+        prompt: 'Hugging Face text-to-image model',
+        value: (current && current.kind === 'huggingface' && current.model) || imageGen.DEFAULT_HF_MODEL
+      });
+      if (!model) return;
+      config = { kind: 'huggingface', model: model.trim() };
+    } else if (picked.kind === 'openai') {
+      const model = await vscode.window.showInputBox({
+        prompt: `Image model of ${picked.provider.name} (as named in its API)`,
+        placeHolder: picked.provider.id === 'openai' ? 'for example gpt-image-1' : 'the exact model id from the provider',
+        value: current && current.kind === 'openai' && current.providerId === picked.provider.id ? current.model : '',
+        validateInput: (v) => (v.trim() ? null : 'Enter the model id')
+      });
+      if (!model) return;
+      config = { kind: 'openai', providerId: picked.provider.id, providerName: picked.provider.name, model: model.trim() };
     }
-    await config.update('responseMode', picked.mode, vscode.ConfigurationTarget.Global);
+    await this._context.globalState.update('localAI.imageGen', config);
+    await this._refreshState();
+  },
+
+  async _chooseAutocomplete() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    const on = config.get('autocomplete') === true;
+    const current = String(config.get('autocompleteModel') || '').trim() || 'auto';
+    const models = (await this._ollamaClient.listLocalModels().catch(() => [])).filter((m) => !cloud.isOllamaCloud(m.name)).sort((a, b) => a.size - b.size);
+    const save = (map) => this._context.globalState.update('localAI.localCaps', map);
+    for (const m of models) await capabilities.learnLocal(this._ollamaClient, m.name, save);
+    const fim = models.filter((m) => capabilities.localCap(m.name, 'insert'));
+    const items = [
+      { label: `${!on ? '$(check) ' : ''}Off`, value: null },
+      { label: `${on && current === 'auto' ? '$(check) ' : ''}Auto: the smallest model that can complete code`, description: fim[0] ? fim[0].name : 'none installed', value: 'auto' },
+      ...(fim.length ? [{ label: 'Installed models that can complete code', kind: vscode.QuickPickItemKind.Separator }] : []),
+      ...fim.map((m) => ({ label: `${on && current === m.name ? '$(check) ' : ''}${m.name}`, description: `${(m.size / 1e9).toFixed(1)} GB`, value: m.name }))
+    ];
+    if (!fim.length) items.push({ label: '$(download) Install qwen2.5-coder:1.5b', description: 'about 1 GB, fast enough for every keystroke', value: 'install' });
+    const picked = await vscode.window.showQuickPick(items, { title: 'Code completion as you type (local only)', placeHolder: 'Small models are best here: they answer before you type the next key.' });
+    if (!picked) return;
+    if (picked.value === 'install') {
+      await this._installModel('qwen2.5-coder:1.5b');
+      return;
+    }
+    await config.update('autocomplete', picked.value !== null, vscode.ConfigurationTarget.Global);
+    if (picked.value) await config.update('autocompleteModel', picked.value === 'auto' ? '' : picked.value, vscode.ConfigurationTarget.Global);
+  },
+
+  async _chooseEmbeddingModel() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    const current = String(config.get('embeddingModel') || '').trim() || 'auto';
+    const models = (await this._ollamaClient.listLocalModels().catch(() => [])).filter((m) => !cloud.isOllamaCloud(m.name));
+    const save = (map) => this._context.globalState.update('localAI.localCaps', map);
+    for (const m of models) await capabilities.learnLocal(this._ollamaClient, m.name, save);
+    const embedders = models.filter((m) => capabilities.localCap(m.name, 'embedding'));
+    const items = [
+      { label: `${current === 'auto' ? '$(check) ' : ''}Auto`, description: embedders[0] ? embedders[0].name : 'no embedding model installed', value: '' },
+      { label: `${current === 'off' ? '$(check) ' : ''}Off`, value: 'off' },
+      ...embedders.map((m) => ({ label: `${current === m.name ? '$(check) ' : ''}${m.name}`, description: `${Math.round(m.size / 1e6)} MB`, value: m.name }))
+    ];
+    if (!embedders.length) items.push({ label: '$(download) Install nomic-embed-text', description: 'about 270 MB', value: 'install' });
+    const picked = await vscode.window.showQuickPick(items, {
+      title: 'Meaning search in the project (semantic_search)',
+      placeHolder: 'A small local model turns the code into vectors so the AI finds "where the login is handled" without exact names.'
+    });
+    if (!picked) return;
+    if (picked.value === 'install') return this._installModel('nomic-embed-text');
+    await config.update('embeddingModel', picked.value, vscode.ConfigurationTarget.Global);
+  },
+
+  async _manageMcp() {
+    const mcpConfig = require('../mcpConfig');
+    const manager = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: 'Starting MCP servers...' },
+      () => mcpConfig.ensure(this._context)
+    );
+    const icons = { ready: '$(check)', failed: '$(error)', starting: '$(sync)', stopped: '$(circle-slash)' };
+    const servers = manager.servers();
+    const picked = await vscode.window.showQuickPick(
+      [
+        ...servers.map((s) => ({
+          label: `${icons[s.status] || ''} ${s.name}`,
+          description: s.status === 'ready' ? `${s.tools.length} tools` : s.status,
+          detail: s.status === 'failed' ? s.error.split('\n')[0] : s.tools.slice(0, 8).join(', '),
+          server: s
+        })),
+        { label: '$(add) Add a server (command)...', action: 'addCommand' },
+        { label: '$(globe) Add a server (URL)...', action: 'addUrl' },
+        { label: '$(json) Edit MCP settings (JSON)', action: 'json' }
+      ],
+      { title: 'MCP servers', placeHolder: servers.length ? 'Pick a server to restart or remove it' : 'No servers yet. Add one, or put a .mcp.json in the project.' }
+    );
+    if (!picked) return;
+    const config = vscode.workspace.getConfiguration('localAI');
+    const current = { ...mcpConfig.userServers() };
+    if (picked.action === 'json') {
+      await vscode.commands.executeCommand('workbench.action.openSettingsJson');
+      return;
+    }
+    if (picked.action === 'addCommand' || picked.action === 'addUrl') {
+      const name = await vscode.window.showInputBox({ prompt: 'Server name', validateInput: (v) => (/^[\w-]{1,30}$/.test(v) ? null : 'Letters, digits, - and _ only') });
+      if (!name) return;
+      if (picked.action === 'addCommand') {
+        const line = await vscode.window.showInputBox({ prompt: 'Command that starts the server', placeHolder: 'npx -y @modelcontextprotocol/server-filesystem /path/to/folder', ignoreFocusOut: true });
+        if (!line) return;
+        const parts = line.trim().split(/\s+/);
+        current[name] = { command: parts[0], args: parts.slice(1) };
+      } else {
+        const url = await vscode.window.showInputBox({ prompt: 'Server URL (Streamable HTTP)', placeHolder: 'https://example.com/mcp', validateInput: (v) => (/^https?:\/\/\S+$/.test(v.trim()) ? null : 'Enter a full URL') });
+        if (!url) return;
+        current[name] = { type: 'http', url: url.trim() };
+      }
+      await config.update('mcpServers', current, vscode.ConfigurationTarget.Global);
+      await mcpConfig.ensure(this._context);
+      const added = mcpConfig.manager.servers().find((s) => s.name === name);
+      if (added && added.status === 'failed') vscode.window.showErrorMessage(`MCP server "${name}" did not start: ${added.error}`);
+      else if (added) vscode.window.showInformationMessage(`MCP server "${name}" is ready with ${added.tools.length} tools.`);
+      return;
+    }
+    const action = await vscode.window.showQuickPick(
+      [{ label: 'Restart', value: 'restart' }, ...(current[picked.server.name] ? [{ label: 'Remove', value: 'remove' }] : [])],
+      { title: picked.server.name }
+    );
+    if (!action) return;
+    if (action.value === 'restart') await mcpConfig.manager.restart(picked.server.name);
+    if (action.value === 'remove') {
+      delete current[picked.server.name];
+      await config.update('mcpServers', current, vscode.ConfigurationTarget.Global);
+      await mcpConfig.ensure(this._context);
+    }
+  },
+
+  async _chooseReviewerModel() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    const current = String(config.get('reviewerModel') || '').trim();
+    const local = (await this._ollamaClient.listLocalModels().catch(() => [])).filter((m) => !/embed/i.test(m.name)).sort((a, b) => b.size - a.size);
+    const cloudModels = this._context.globalState.get('localAI.cloudModels', []);
+    const picked = await vscode.window.showQuickPick([
+      { label: `${!current ? '$(check) ' : ''}Same model as the chat`, description: 'default', value: '' },
+      ...(local.length ? [{ label: 'Installed models', kind: vscode.QuickPickItemKind.Separator }] : []),
+      ...local.map((m) => ({ label: `${current === m.name ? '$(check) ' : ''}${m.name}`, description: `${(m.size / 1e9).toFixed(1)} GB`, value: m.name })),
+      ...(cloudModels.length ? [{ label: 'Cloud models (the changed files are sent there)', kind: vscode.QuickPickItemKind.Separator }] : []),
+      ...cloudModels.map((m) => ({ label: `${current === m.name ? '$(check) ' : ''}${m.modelId}`, description: m.providerId, value: m.name }))
+    ], { title: 'Reviewer agent model', placeHolder: 'A second, stronger model catches mistakes the chat model makes. Used when "Check changes" runs the reviewer.' });
+    if (!picked || picked.value === undefined) return;
+    await config.update('reviewerModel', picked.value, vscode.ConfigurationTarget.Global);
+  },
+
+  async _showUsageStats() {
+    const usageStats = require('../usageStats');
+    const fmt = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : String(Math.round(n)));
+    const period = await vscode.window.showQuickPick(
+      [{ label: 'Today', days: 1 }, { label: 'Last 7 days', days: 7 }, { label: 'Last 30 days', days: 30 }],
+      { title: 'Usage statistics' }
+    );
+    if (!period) return;
+    const rows = usageStats.summary(this._context, period.days);
+    await vscode.window.showQuickPick(
+      rows.length
+        ? rows.map((r) => ({
+          label: r.model.replace(/^cloud:([^:]+):/, '$1: '),
+          description: `${fmt(r.prompt)} in · ${fmt(r.output)} out · ${r.requests} requests`,
+          detail: `${r.model.startsWith('cloud:') || /[:-]cloud$/.test(r.model) ? 'Cloud' : 'Local'} · about ${r.tokensPerSec.toFixed(1)} tokens/s`
+        }))
+        : [{ label: 'No requests in this period yet.' }],
+      { title: `Usage: ${period.label.toLowerCase()}`, placeHolder: 'Tokens read (in) and written (out) per model. Cloud tokens count against your free limits.' }
+    );
+  },
+
+  async _chooseAgentMode() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    const current = String(config.get('agentMode') || 'auto');
+    const items = [
+      { value: 'auto', label: 'Auto', detail: 'Picked from the model: fast for 4B or slow models, standard for 7-13B, agent for strong cloud models and fast 14B+.' },
+      { value: 'direct', label: 'Fast', detail: 'One pass: the model sees the relevant files and returns complete files. Quickest and most reliable with small models.' },
+      { value: 'standard', label: 'Standard', detail: 'Works with tools and a short plan, no helper agents.' },
+      { value: 'agent', label: 'Agent', detail: 'Full tool loop with helper agents for big jobs. Needs a strong model that runs fast.' }
+    ].map((i) => ({ ...i, label: `${i.value === current ? '$(check) ' : ''}${i.label}` }));
+    const picked = await vscode.window.showQuickPick(items, { title: 'Work mode: how the AI works on your project' });
+    if (picked) await config.update('agentMode', picked.value, vscode.ConfigurationTarget.Global);
+  },
+
+  async _chooseThinking() {
+    const config = vscode.workspace.getConfiguration('localAI');
+    const current = generationLib.thinkingMode();
+    const details = {
+      auto: 'Each model uses its own default.',
+      fast: 'Skips most of the thinking. Best for small edits and questions.',
+      deep: 'Thinks longer before it answers. Best for hard bugs and planning.'
+    };
+    const picked = await vscode.window.showQuickPick(
+      Object.entries(generationLib.THINKING).map(([id, label]) => ({ label: `${id === current ? '$(check) ' : ''}${label}`, detail: details[id], value: id })),
+      { title: 'Thinking (local models that can reason: Qwen3, GPT-OSS, DeepSeek-R1...)' }
+    );
+    if (picked) await config.update('thinking', picked.value, vscode.ConfigurationTarget.Global);
   },
 
   async _chooseContext() {
@@ -45,79 +241,6 @@ module.exports = {
       { title: 'Context length (how much the model remembers)', placeHolder: 'Larger values use more RAM and are slower. Models have their own maximum.' }
     );
     if (picked) await config.update('contextSize', picked.value, vscode.ConfigurationTarget.Global);
-  },
-
-  async _chooseHelperModel() {
-    const config = vscode.workspace.getConfiguration('localAI');
-    const current = String(config.get('subagentModel') || '').trim();
-    const models = await this._ollamaClient.listLocalModels().catch(() => []);
-    const items = [
-      { label: `${current === '' ? '$(check) ' : ''}Same model as the chat`, description: 'default', detail: 'Helpers use the model you chat with.', value: '' },
-      { label: `${current === 'auto' ? '$(check) ' : ''}Auto: the smallest installed model`, description: 'fast helpers', detail: 'With a local chat model, research helpers use your smallest installed model that is smaller than it. With a cloud chat model, helpers use that same cloud model. Helpers that edit files always use the chat model.', value: 'auto' },
-      { label: 'Installed models', kind: vscode.QuickPickItemKind.Separator },
-      ...models
-        .slice()
-        .sort((a, b) => a.size - b.size)
-        .map((m) => {
-          const entry = require('../catalog').models.find((c) => c.name === m.name);
-          const tools = entry ? (entry.tags || []).includes('tools') : true;
-          return {
-            label: `${current === m.name ? '$(check) ' : ''}${m.name}`,
-            description: `${(m.size / 1e9).toFixed(1)} GB`,
-            detail: tools
-              ? 'Can use tools: reads and searches files itself.'
-              : 'No tools: reads the files directly (fast, good for simple reading tasks).',
-            value: m.name
-          };
-        })
-    ];
-    const picked = await vscode.window.showQuickPick(items, {
-      title: 'Which model should research helpers use?',
-      placeHolder: 'A small fast model is enough for simple reading and summarising. Helpers that edit files always use the chat model.'
-    });
-    if (!picked || picked.value === undefined) return;
-    await config.update('subagentModel', picked.value, vscode.ConfigurationTarget.Global);
-  },
-
-  async _chooseGpu() {
-    const config = vscode.workspace.getConfiguration('localAI');
-    const picked = await vscode.window.showQuickPick(
-      [
-        { label: 'Automatic', description: 'Ollama decides (recommended)', value: -1 },
-        { label: 'CPU only', description: 'Slowest, but frees the GPU and video memory', value: 0 },
-        { label: 'Custom number of GPU layers...', description: 'for fine tuning when the model does not fit in video memory', value: 'custom' }
-      ],
-      { title: 'Where should the model run?' }
-    );
-    if (!picked) return;
-    let value = picked.value;
-    if (value === 'custom') {
-      const typed = await vscode.window.showInputBox({
-        prompt: 'Number of layers to put on the GPU (lower = less video memory)',
-        validateInput: (v) => (/^\d+$/.test(v) ? null : 'Enter a whole number, 0 or more')
-      });
-      if (typed === undefined) return;
-      value = Number(typed);
-    }
-    await config.update('gpuLayers', value, vscode.ConfigurationTarget.Global);
-  },
-
-  async _promptKeepAlive() {
-    const options = [
-      { label: '5m (default)', value: '' },
-      { label: '30m', value: '30m' },
-      { label: '1h', value: '1h' },
-      { label: 'Forever (stays loaded until you change it)', value: '-1' },
-      { label: 'Unload immediately after each reply', value: '0' }
-    ];
-    const picked = await vscode.window.showQuickPick(
-      options.map((o) => o.label),
-      { title: 'How long should Ollama keep the model loaded in RAM?' }
-    );
-    if (picked === undefined) return;
-    const match = options.find((o) => o.label === picked);
-    await this._context.globalState.update('localAI.keepAlive', match.value);
-    await this._refreshState();
   },
 
   async _promptSystemPrompt() {

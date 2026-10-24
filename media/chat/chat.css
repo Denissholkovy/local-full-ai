@@ -705,3 +705,9 @@ button:focus-visible, textarea:focus-visible { outline: 1px solid var(--accent);
 }
 .activity .typing-dot { width: 5px; height: 5px; margin-right: 2px; }
 .activity-text { margin-left: 4px; }
+
+.gen-image { margin: 6px 0 2px; }
+.gen-image img { display: block; max-width: 100%; max-height: 320px; border-radius: 6px; cursor: pointer; border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.3)); }
+.mode-pill { font-size: 9.5px; padding: 1px 6px; border-radius: 8px; margin-left: 4px; flex-shrink: 0; background: rgba(128,128,128,0.2); color: var(--vscode-descriptionForeground); }
+.mode-pill.mode-agent { background: rgba(76,175,80,0.2); color: var(--vscode-testing-iconPassed, #4caf50); }
+.mode-pill.mode-direct { background: rgba(217,130,43,0.2); color: #d9822b; }

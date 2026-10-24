@@ -1,4 +1,5 @@
 const { vscode, modelState, RECOMMENDED_MODELS, ollamaProcess, modelTags, generationLib, hardware } = require('./common');
+const consent = require('../consent');
 
 // Methods mixed into SidebarProvider.prototype (see sidebarProvider.js).
 module.exports = {
@@ -133,8 +134,17 @@ module.exports = {
     }
   },
 
+  // Ollama Cloud models need an ollama.com account; "ollama signin" opens the browser to link this computer.
+  _ollamaSignin() {
+    const binary = ollamaProcess.findBinary();
+    const terminal = vscode.window.createTerminal('Ollama sign in');
+    terminal.show();
+    terminal.sendText(`${binary ? `"${binary}"` : 'ollama'} signin`);
+  },
+
   async _installModel(modelName, sizeOverrideGB) {
     if (!this._view || this._pullInProgress.has(modelName)) return;
+    if (!(await consent.ensure(this._context, modelName))) return;
 
     const catalogEntry = RECOMMENDED_MODELS.find((m) => m.name === modelName);
     const knownSize = typeof sizeOverrideGB === 'number' ? sizeOverrideGB : catalogEntry && catalogEntry.sizeGB;

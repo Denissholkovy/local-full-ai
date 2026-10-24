@@ -132,6 +132,50 @@ function run(tools) {
   return issues.slice(0, MAX_ISSUES);
 }
 
+const CONTROL_RE = /<(button|input|select|textarea)\b([^>]*)>/gi;
+
+function controls(htmlText) {
+  const out = [];
+  let m;
+  CONTROL_RE.lastIndex = 0;
+  while ((m = CONTROL_RE.exec(String(htmlText || ''))) !== null) {
+    const attrs = m[2];
+    const type = (/\btype\s*=\s*["']?([\w-]+)/i.exec(attrs) || [])[1] || '';
+    if (/^(hidden|submit|reset)$/i.test(type)) continue;
+    out.push({
+      tag: m[1].toLowerCase(),
+      id: (/\bid\s*=\s*["']([^"']+)["']/i.exec(attrs) || [])[1] || '',
+      classes: ((/\bclass\s*=\s*["']([^"']+)["']/i.exec(attrs) || [])[1] || '').split(/\s+/).filter(Boolean),
+      inline: /\bon[a-z]+\s*=/i.test(attrs),
+      key: m[0].replace(/\s+/g, ' ')
+    });
+  }
+  return out;
+}
+
+// Buttons and fields added by this change that no script uses: a feature that looks done but does nothing
+// (a "calculator" made of three buttons without any logic). `code` is all the project's JavaScript.
+function deadControls(beforeHtml, afterHtml, code) {
+  const before = new Set(controls(beforeHtml).map((c) => c.key));
+  const added = controls(afterHtml).filter((c) => !before.has(c.key) && !c.inline);
+  if (!added.length) return null;
+  const clean = stripComments(String(code || ''));
+  const used = (c) => (c.id && new RegExp(`["'\`#]${c.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(clean)) ||
+    c.classes.some((cls) => new RegExp(`\\.${cls.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b|["'\`]${cls}["'\`]`).test(clean));
+  if (added.some(used)) return null;
+  const names = added.map((c) => (c.id ? `#${c.id}` : c.classes.length ? `${c.tag}.${c.classes[0]}` : c.tag)).slice(0, 8);
+  return `The new controls (${names.join(', ')}) are not used by any script, so they do nothing. Write the complete logic for this feature in JavaScript (the page's script file or an inline script) and add any buttons it still needs.`;
+}
+
+function scriptCode(tools) {
+  try {
+    const { html, js } = collect(tools);
+    return [...js.map((j) => j.text), ...html.flatMap((h) => inlineScripts(h.text))].join('\n');
+  } catch (_) {
+    return '';
+  }
+}
+
 // Names a piece of code defines (functions, classes, arrow-function constants, Python defs).
 function definedNames(text) {
   const names = new Set();
@@ -153,4 +197,4 @@ function format(issues) {
   return issues.length ? issues.map((i) => `- ${i}`).join('\n') : '';
 }
 
-module.exports = { run, format, definedNames };
+module.exports = { run, format, definedNames, deadControls, scriptCode };

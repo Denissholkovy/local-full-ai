@@ -5,11 +5,53 @@ All notable changes to the "Local Full AI" extension are documented here.
 ## [Unreleased]
 
 ### Fixed
+- Small local models (under 13B, such as qwen3:4b) spent minutes "thinking" before every short answer. Thinking now has a
+  budget (about 1000 tokens for small models, 4000 for big ones, none with "Deep"): when it is used up, or the model thinks
+  in circles, the thinking is closed and the model continues straight with the answer. Models that cannot switch thinking
+  off (Qwen3 "Thinking" builds) are no longer sent think:false, which made their thoughts appear as the answer, and
+  thoughts that leak into an answer are hidden.
+- Models use their own recommended sampling settings (temperature and so on) again; a fixed low temperature made
+  thinking models loop.
+- A feature could be "done" with buttons that do nothing (a calculator of three buttons and no code). The checks after a
+  change now report new buttons and fields that no script uses, and the AI adds the missing logic.
+- Local models could show the same answer twice: a model that repeats its previous text after a tool result or a fix
+  round, an autopilot summary written both as text and in finish_task, and a retried request that left the cut-off text of
+  the failed attempt in front of the new one.
+- Cloud answers were stopped after 2 minutes in total, also while they were still streaming or waiting for a rate limit.
+  Now only 90 seconds of silence stop a request.
+- A large file written by a cloud model could be cut off by the output limit and saved half empty. Cut-off tool calls are
+  dropped and the model is asked to write the file in parts; the output limit is 8K tokens where the provider allows it.
+- Limits of Groq, Gemini and Cerebras are tracked per model, so one model's used-up budget no longer delays another.
+- Tool and image support of local models is read from Ollama (`/api/show`) instead of guessed from the name, and the
+  context length never exceeds what the model supports.
+- Ollama requests had no timeout: a model that never answered hung the chat. The chat now says when a model is being
+  loaded into memory.
+- "Ask About Selected Code" lost the selection when the chat panel opened for the first time.
+- Chats are stored as files in the extension storage instead of VS Code's global state (old chats are moved over), which
+  kept pictures and tool output in memory on every start.
 - A fix round could break working code: the reviewer reported a non-problem and the model rewrote a whole file, dropping
   functions the page still used. Now a rewrite that removes functions still in use is undone right away, a fix round
   that makes the checks worse is rolled back, and the reviewer only fails real breakage (quoting the wrong line).
 
 ### Changed
+- Fewer settings. Removed: Response mode and its Custom values (temperature, top-p, top-k, repeat penalty; answers always
+  use the precise preset, the most reliable for code and tools), GPU layers (Ollama decides), `multiAgent` (the work mode
+  decides about helper agents), "Send active file" (the open file is already shown to the model) and the unused
+  `selectedModel`. Keep model in RAM, Cloud context size and Helper agents model left the sidebar (still in the settings
+  JSON); models now stay loaded for 30 minutes by default.
+- **Work modes** (`localAI.agentMode`, shown next to the model in the chat): **Fast** for 4B and slow models (the model
+  gets the relevant files and answers with complete files in one pass), **Standard** for 7-13B (tools and a short plan
+  with checkable items, no helper agents), **Agent** for strong cloud models and fast 14B+ (full loop with helpers).
+  Auto picks from the model's size and its measured speed.
+- The files shown to the model include the scripts and styles linked from a page, so a feature can get its JavaScript.
+- A file written with a block repeated (a page pasted twice) is not saved, and the model is told why.
+- `edit_file` also finds the code when only the indentation differs.
+- Shorter, clearer replies: the answer first, no introductions.
+- Helper agents no longer start for every task. They are offered only when you ask for them, or for tasks in a large
+  project (60+ source files), at most 3 per request (6 in autopilot), and each gets a structured brief (goal, known files,
+  what is already known, the report it must return). "Parallel" or "user agent" in a message no longer forces them.
+- The reviewer agent runs only for bigger changes (3+ files or 80+ changed lines, and in autopilot); small edits get the
+  quick checks. `localAI.verifyChanges: "always"` keeps the old behaviour.
 - Autopilot runs only test/build/lint/inspect commands (plus `localAI.autopilotCommands`) and never a script it
   just wrote; very small models (4B and below) no longer start helper agents.
 - The sidebar no longer runs uninstall commands for Ollama; it shows the steps instead.
@@ -17,7 +59,31 @@ All notable changes to the "Local Full AI" extension are documented here.
 - Windows: command and Ollama processes are stopped with their whole process tree; voice input works with ffmpeg.
 
 ### Added
-- **Reviewer agent**: after a task that changed files, quick checks plus (for capable models) a reviewer agent check the
+- **OpenAI-compatible servers**: LM Studio, llama.cpp, Jan, vLLM or any other address, as many as you like, key optional.
+  Servers on this computer need no cloud notice.
+- **Ollama Cloud** models (Kimi K2.7 Code, GLM 5.3, DeepSeek V4, MiniMax M3) through your Ollama, with sign-in from the sidebar.
+- New providers: Hugging Face, NVIDIA, DeepSeek, OpenAI and Anthropic (the paid ones are marked).
+- **Switch model when a limit is hit** (`localAI.cloudAutoFallback`): continue with your next cloud model instead of waiting.
+- **Pictures**: the agent can make images for the project (`generate_image`) with Stable Diffusion WebUI / Forge / Draw
+  Things on this computer, Hugging Face, or an OpenAI-compatible images API; previews in the chat; command
+  **Generate Image**. Icons are still drawn as SVG.
+- **Code completion as you type** with a small local model (`localAI.autocomplete`, status bar toggle).
+- **Meaning search** (`semantic_search`) with a local embedding model such as nomic-embed-text.
+- **MCP servers**: tools from `localAI.mcpServers` and, after you allow each one, the project's `.mcp.json`.
+- **`@local`** in VS Code's own chat view.
+- **`get_problems`**: the agent reads the Problems panel, and the checks after a change include new errors from the
+  language servers.
+- **Edit a message**: removes it and what followed, puts its text back in the input and can restore the files the AI changed
+  since then (every request keeps a checkpoint).
+- **Write Commit Message** in Source Control, **Fix Selected Terminal Error** in the terminal menu, and
+  **Fix / Explain with Local Full AI** on the light bulb.
+- **`web_fetch`**: the agent can read public web pages after you approve each one (never in autopilot).
+- **Reviewer model** (`localAI.reviewerModel`): a second model checks the work.
+- **Thinking** setting for local reasoning models (fast / deep).
+- Long chats are summarised instead of silently dropping the oldest messages.
+- **Usage statistics** per model and day.
+- Unit tests (`npm test`) that also run in CI before publishing.
+: after a task that changed files, quick checks plus (for capable models) a reviewer agent check the
   work and the AI fixes what is broken, up to two rounds (`localAI.verifyChanges`).
 - **Project memory** (`.localai/memory.md`, plus `AGENTS.md` / `CLAUDE.md`) and a map of where things are defined in
   every request.

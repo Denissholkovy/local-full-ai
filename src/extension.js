@@ -43,6 +43,10 @@ function activate(context) {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('localAI.generateImage', () => require('./imageCommand').run(context))
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('localAI.copyDiagnostics', async () => {
       const text = await diagnostics.build(context, ollamaClient);
       await vscode.env.clipboard.writeText(text);
@@ -55,6 +59,9 @@ function activate(context) {
   } catch (_) {
   }
   beforeContent.register(context);
+  require('./inlineCompletion').register(context, ollamaClient);
+  require('./chatParticipant').register(context, ollamaClient);
+  require('./quickActions').register(context, ollamaClient, () => ChatPanel.createOrShow(context, ollamaClient));
 
   const sidebarProvider = new SidebarProvider(context, ollamaClient);
   context.subscriptions.push(
@@ -70,6 +77,8 @@ function activate(context) {
 
 async function deactivate() {
   if (ChatPanel.currentPanel) ChatPanel.currentPanel.dispose();
+  require('./chatStore').flush();
+  require('./mcpConfig').manager.stopAll();
   voice.cancelAll();
   const stoppedOwnServer = ollamaProcess.stopServer();
   const unload = vscode.workspace.getConfiguration('localAI').get('unloadModelsOnClose') !== false;
