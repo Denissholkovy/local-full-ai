@@ -3,7 +3,7 @@
   "displayName": "Local Full AI",
   "publisher": "Denys-Shovkovyi",
   "description": "A private AI coding assistant for VS Code, powered by local Ollama models, with optional free cloud models when local ones are too weak: chat, edit your project with approval, autopilot, helper agents, voice input and model management.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "license": "MIT",
   "icon": "media/icon.png",
   "keywords": [
