@@ -3,7 +3,7 @@
   "displayName": "Local Full AI",
   "publisher": "Denys-Shovkovyi",
   "description": "Private AI coding assistant on local Ollama models: builds features and fixes bugs in your project with targeted edits, checks its own work, adapts to small and large models. Optional free cloud models.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "license": "MIT",
   "icon": "media/icon.png",
   "keywords": [
