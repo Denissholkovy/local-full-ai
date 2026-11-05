@@ -1,11 +1,21 @@
 # Local Full AI
 
-A private AI coding assistant that runs **on your computer by default**, powered by [Ollama](https://ollama.com).
-Local models too weak? You can optionally connect a **free cloud model** (Groq, OpenRouter, Google Gemini and others) with your own free key.
-Chat about your code, let it create and edit files in your project (with your approval), run on autopilot,
-split big jobs between helper agents, talk to it with your voice, and manage your models,
-all inside VS Code. Local use needs no account, no API key and no subscription, and your code stays on your machine.
-Cloud models are strictly opt-in and clearly marked.
+**A private AI coding assistant that runs on your own computer.** Chat about your code, let it build features and
+fix bugs right in your project files, with your approval, using free local models through [Ollama](https://ollama.com).
+No account, no API key, no subscription. Your code stays on your machine.
+
+Local models too weak for a job? Optionally connect a **free cloud model** (Groq, OpenRouter, Google Gemini and
+others) with your own free key. Cloud models are strictly opt-in and clearly marked.
+
+![Local Full AI: model sidebar and chat building a page in the project](media/screenshots/hero.png)
+
+**Why it works well with small models**
+- **It adapts to your model.** A 4B model gets a fast one-pass mode, a 7B model gets tools and a short plan, a big or
+  cloud model gets the full agent with helpers. Picked automatically from the model's size and measured speed.
+- **Corrections, not rewrites.** "Make the button green" changes that one line, not the whole file. Edits that would
+  wipe out most of a file are refused and retried.
+- **It checks its own work.** Syntax, buttons with no code behind them, missing scripts and new errors are caught and
+  sent back to the model before you see the result. **Undo changes** restores everything in one click.
 
 ## Highlights
 
@@ -17,11 +27,22 @@ Cloud models are strictly opt-in and clearly marked.
 - Small models answer without minutes of "thinking"; a model that thinks too long or in circles is asked again without it.
 - New buttons that no script uses, and files with a block pasted twice, are caught and sent back to the model.
 
+**Corrections, not rewrites**
+- A correction ("make the button green", "subtraction is wrong") changes only that part, with targeted edits. If a
+  model rewrites most of a file for a small correction, the result is not saved and the model tries again. Say
+  "rewrite" or "from scratch" when you do want everything redone.
+- In Fast mode a new feature is built in steps: a plan (shown in the chat), then one file at a time.
+  Turn on `localAI.confirmPlan` to approve or change the plan first.
+
+![A new feature built in steps: plan, then one file at a time, then checks](media/screenshots/plan.png)
+
 **Works on your project**
 - Reads, searches, creates and edits files in the open folder and shows the work as steps
   (*Creating index.html*, *Updating script.js*) with an expandable diff, **Open file** and **Open diff**.
 - Every edit and command asks first (*Allow* / *Allow in this chat* / *Deny*, or type what to do instead).
   Modes: **Ask before edits**, **Edit automatically**, **Read only**, **Autopilot**.
+
+  ![Permission request inside the chat](media/screenshots/permission.png)
 - The chat is for talking and corrections: code goes into files, not into the conversation.
   Ask for a change later and it continues from the current file on disk, including your own edits.
 - **Autopilot**: give a task and walk away. It plans, works, checks the project, retries, and stops only when
@@ -88,13 +109,20 @@ Cloud models are strictly opt-in and clearly marked.
   files relevant to your request are shown to the model directly, so it does not waste requests searching for them.
 
 **Models made easy**
+
+<img src="media/screenshots/sidebar.png" alt="Sidebar with the active model, installed models and settings" width="340" align="right">
+
 - Guided Ollama setup, a hand-picked catalog (Code, General, Vision), cancel a download any time.
+- Every model says plainly what it is good for: *chat only*, *chat & small edits*, *simple tasks* or
+  *good for projects*.
 - **Pick the quantization** from the live Ollama list with exact sizes and context length.
 - **Fit for your computer**: Apple Silicon, NVIDIA or CPU is detected; every model and quantization is marked
   *fits well / tight / slow / too heavy*, with a recommended pick.
 - Context length from 4K to 128K (never more than the model supports). Answers use low randomness, the most reliable
   setting for code and tools, and the model stays loaded for 30 minutes between messages so answers start quickly.
 - Switching the model is announced in the chat.
+
+<br clear="right">
 
 **More than chat**
 - **Code completion as you type**: grey suggestions from a small local model (for example `qwen2.5-coder:1.5b`), Tab to
@@ -138,6 +166,9 @@ Cloud models are strictly opt-in and clearly marked.
 3. Pick a model under **Get more models** (look for the ★ *best for your PC* tag and the **tools** tag) and wait for it to download.
 4. Press **Open chat**. Open a folder in VS Code so the AI can work on your project.
 5. Try: *"Create a simple calculator in index.html"*, or select code and run **Ask about selected code**.
+   The empty chat suggests requests that fit the open project.
+
+![Empty chat with suggestions for the open project](media/screenshots/empty.png)
 
 Tips: models tagged `tools` (Qwen2.5 Coder 7B or larger, Qwen3) work on your project; models without it still save
 code into files ("files mode") but cannot read your project on their own. Small models are fast but need clear, short requests.
@@ -156,6 +187,7 @@ Most options are in the sidebar under **Settings**. The full list:
 | `localAI.unloadModelsOnClose` | on | When VS Code closes, unload the models from RAM if Ollama was started by something other than this extension. A server started by this extension is stopped completely. |
 | `localAI.autoSkills` | on | Pick the skills that match each request and give them to the model directly, so skills work with every model (no tool calling needed). |
 | `localAI.cloudContextSize` | 12000 | (Settings JSON only; lowered automatically from the provider's limits) How many tokens of chat and project context are sent to a cloud model. Free tiers have small per-minute token limits, so keep this modest. |
+| `localAI.confirmPlan` | off | Fast mode: wait for your OK (or changes) to the plan of a new feature before code is written. |
 | `localAI.agentMode` | auto | How the AI works: auto, direct (fast, one pass with complete files), standard (tools and a plan) or agent (tools and helper agents). |
 | `localAI.subagentModel` | (empty) | (Settings JSON only) Model for research helper agents. Empty = same as the chat, "auto" = the smallest installed model, or an exact model name. A small model is fast for simple reading tasks; helpers that edit files always use the chat model. |
 | `localAI.language` | auto | Language of the sidebar and chat interface: "auto" follows VS Code, "en" English, "uk" Ukrainian. Applies when the panel is opened again. Messages from VS Code itself (pickers, notifications) stay in English. |

@@ -36,5 +36,5 @@ test('edit_file finds the code when only the indentation differs', async () => {
 
 test('an ambiguous loose match is refused', async () => {
   const { tools } = project({ 'b.js': '  go();\n    go();\n' });
-  await assert.rejects(tools.run('edit_file', { path: 'b.js', old_string: 'go();', new_string: 'stop();' }), /more than once|not found/);
+  await assert.rejects(tools.run('edit_file', { path: 'b.js', old_string: 'go();', new_string: 'stop();' }), /occurs \d+ times|not found/);
 });

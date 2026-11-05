@@ -71,13 +71,14 @@ const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'edit_file',
-      description: 'Edit a file by replacing one exact piece of text. "old_string" must match the file exactly and occur once. Read the file first.',
+      description: 'Change an existing file by replacing one piece of text: the way to make corrections. "old_string" must be copied from the file (a few lines that occur once). Use several small edit_file calls for several changes.',
       parameters: {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'File path relative to the project root' },
           old_string: { type: 'string', description: 'Exact existing text to replace' },
-          new_string: { type: 'string', description: 'Replacement text' }
+          new_string: { type: 'string', description: 'Replacement text' },
+          replace_all: { type: 'boolean', description: 'Replace every occurrence (for renaming a name everywhere in the file)' }
         },
         required: ['path', 'old_string', 'new_string']
       }
@@ -87,7 +88,7 @@ const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'write_file',
-      description: 'Create a new file or completely overwrite an existing one. Prefer edit_file for small changes.',
+      description: 'Create a new file with its complete content. Overwrite an existing file only when the user asked to rewrite it; for changes use edit_file.',
       parameters: {
         type: 'object',
         properties: {
@@ -185,6 +186,50 @@ function looseMatch(text, needle) {
   return { start, end };
 }
 
+const KEEP_RATIO = 0.35;
+const KEEP_MIN_LINES = 6;
+
+// A correction should keep the file: returns why a new version drops too much of the old one, or null.
+function rewriteProblem(before, after) {
+  const old = String(before || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (!old.length) return null;
+  const pool = new Map();
+  String(after || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).forEach((l) => pool.set(l, (pool.get(l) || 0) + 1));
+  const gone = [];
+  old.forEach((l) => {
+    const n = pool.get(l) || 0;
+    if (n > 0) pool.set(l, n - 1);
+    else gone.push(l);
+  });
+  const allowed = Math.max(KEEP_MIN_LINES, Math.ceil(old.length * KEEP_RATIO));
+  if (gone.length <= allowed) return null;
+  const sample = gone.slice(0, 6).map((l) => `  ${l.slice(0, 100)}`).join('\n');
+  return `Not saved: this is a correction, but the new version removes or changes ${gone.length} of ${old.length} lines, for example:\n${sample}\nChange only what the user asked for and keep everything else exactly as it is. Use small targeted edits (edit_file, or <edit> blocks) instead of rewriting the file.`;
+}
+
+// The part of `text` that looks most like the first line of `needle`, numbered, so the model can copy it exactly.
+function closestRegion(text, needle) {
+  const lines = text.split('\n');
+  const first = (String(needle).split('\n').map((l) => l.trim()).find(Boolean) || '').toLowerCase();
+  const words = new Set(first.split(/[^\p{L}\p{N}_$#.-]+/u).filter((w) => w.length > 1));
+  let best = 0;
+  let bestScore = -1;
+  lines.forEach((l, i) => {
+    const lower = l.toLowerCase();
+    let score = 0;
+    words.forEach((w) => {
+      if (lower.includes(w)) score += w.length;
+    });
+    if (score > bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  });
+  const from = Math.max(0, best - 3);
+  const span = Math.max(8, String(needle).split('\n').length + 4);
+  return lines.slice(from, from + span).map((l, k) => `${String(from + k + 1).padStart(4)}| ${l}`).join('\n');
+}
+
 function killTree(child) {
   try {
     // On Windows a shell child keeps running unless the whole tree is ended.
@@ -239,7 +284,13 @@ class WorkspaceTools {
   }
 
   _realOf(relPath) {
-    const abs = path.resolve(this.root, relPath || '.');
+    let rel = relPath || '.';
+    // Models often start paths with the project folder's own name ("my-app/index.html").
+    const own = path.basename(this.root);
+    if (!path.isAbsolute(rel) && (rel === own || rel.startsWith(`${own}/`)) && !fs.existsSync(path.resolve(this.root, rel))) {
+      rel = rel === own ? '.' : rel.slice(own.length + 1);
+    }
+    const abs = path.resolve(this.root, rel);
     let probe = abs;
     while (!fs.existsSync(probe)) {
       const parent = path.dirname(probe);
@@ -698,8 +749,10 @@ class WorkspaceTools {
     }
     const fileFilter = glob ? globToRegExp(glob) : null;
     const matches = [];
+    // A path to one file searches that file (walking it as a folder found nothing and misled the model).
+    const walk = fs.existsSync(dir) && fs.statSync(dir).isFile() ? (_d, visit) => visit(dir) : (d, visit) => this._walk(d, visit);
 
-    this._walk(dir, (file) => {
+    walk(dir, (file) => {
       const rel = this.relative(file).split(path.sep).join('/');
       if (fileFilter && !fileFilter.test(rel)) return true;
       let stat;
@@ -730,7 +783,7 @@ class WorkspaceTools {
     return matches.join('\n') + (matches.length >= MAX_SEARCH_MATCHES ? `\n... (stopped after ${MAX_SEARCH_MATCHES} matches; narrow the search)` : '');
   }
 
-  _editFile({ path: filePath, old_string: oldString, new_string: newString }) {
+  _editFile({ path: filePath, old_string: oldString, new_string: newString, replace_all: replaceAll }) {
     if (!filePath) throw new Error('"path" is required');
     if (typeof oldString !== 'string' || oldString === '') throw new Error('"old_string" is required');
     if (typeof newString !== 'string') throw new Error('"new_string" is required');
@@ -741,6 +794,12 @@ class WorkspaceTools {
     const crlf = text.includes('\r\n');
     const toFile = (value) => (crlf ? value.replace(/\r?\n/g, '\r\n') : value);
     const target = toFile(oldString);
+    if (replaceAll === true || replaceAll === 'true') {
+      const count = text.split(target).length - 1;
+      if (!count) throw new Error(`old_string was not found in ${this.relative(abs)}. The closest part of the file is (line numbers are not part of the code):\n${closestRegion(text, oldString)}`);
+      fs.writeFileSync(abs, text.split(target).join(toFile(newString)));
+      return `Edited ${this.relative(abs)} (${count} place${count > 1 ? 's' : ''})`;
+    }
     const first = text.indexOf(target);
     if (first === -1) {
       const loose = looseMatch(text, oldString);
@@ -756,11 +815,11 @@ class WorkspaceTools {
         return `Edited ${this.relative(abs)} (matched ignoring indentation)`;
       }
       throw new Error(
-        `old_string was not found in ${this.relative(abs)}. Here is the file as it is now:\n${truncate(text, 4000)}\n---\nCopy old_string exactly from it, or (better for a small file) call write_file with the complete updated content.`
+        `old_string was not found in ${this.relative(abs)}. The closest part of the file is (line numbers are not part of the code):\n${closestRegion(text, oldString)}\nCopy the lines exactly as they are in the file and try again. Change only what is needed.`
       );
     }
     if (text.indexOf(target, first + 1) !== -1) {
-      throw new Error('old_string occurs more than once. Include more surrounding lines to make it unique.');
+      throw new Error(`old_string occurs ${text.split(target).length - 1} times. To change all of them (for example to rename something), call edit_file again with "replace_all": true. To change only one, include more surrounding lines so it is unique.`);
     }
     fs.writeFileSync(abs, text.slice(0, first) + toFile(newString) + text.slice(first + target.length));
     return `Edited ${this.relative(abs)}`;
@@ -815,4 +874,4 @@ class WorkspaceTools {
   }
 }
 
-module.exports = { WorkspaceTools, normalizeArgs, truncate, globToRegExp, repeatedBlock, looseMatch };
+module.exports = { WorkspaceTools, normalizeArgs, truncate, globToRegExp, repeatedBlock, looseMatch, rewriteProblem, closestRegion };

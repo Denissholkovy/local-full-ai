@@ -2,7 +2,7 @@
 
 All notable changes to the "Local Full AI" extension are documented here.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-05
 
 ### Fixed
 - Small local models (under 13B, such as qwen3:4b) spent minutes "thinking" before every short answer. Thinking now has a
@@ -32,8 +32,38 @@ All notable changes to the "Local Full AI" extension are documented here.
 - A fix round could break working code: the reviewer reported a non-problem and the model rewrote a whole file, dropping
   functions the page still used. Now a rewrite that removes functions still in use is undone right away, a fix round
   that makes the checks worse is rolled back, and the reviewer only fails real breakage (quoting the wrong line).
+- The sidebar called a 7B model in 4-bit "simple tasks" because it judged by file size; it now uses the parameter count.
 
 ### Changed
+- **Clearer chat.** The steps of an answer collapse into one line ("Created index.html, style.css, script.js"), with the
+  details one click away. Progress messages (loading the model, planning, writing file 2 of 3, checking) update one status
+  line instead of piling up; under a finished answer a quiet line says how long it took, how many files changed and
+  whether the checks passed, with **Undo changes** and **Retry**. The plan of a feature is a checklist that fills in.
+  The permission dialog has three buttons in a row; "something else" opens the text field.
+- **Input bar:** the model name always fits, with the work mode next to it; permissions are an icon (shield, pencil,
+  eye, bolt) with a label when there is room; the helper agents pill shows only when helpers ran.
+- **Sidebar:** the active model appears once, with plain words ("2.5 GB · chat & small edits", "sees images") instead of
+  quantization and tool tags (still in the tooltip). Settings are split into the main ones and **Advanced**.
+- Suggestions in an empty chat fit the folder (something to build in an empty one, something to do in a full one).
+- **Complete Ukrainian interface**, including the messages with values in them (model names, files, counts) and
+  tooltips; the plan of a feature is written in the user's language.
+- **Corrections stay corrections.** Each message is read as a question, a new feature, a correction or a request to
+  rewrite. A correction is made with targeted edits (`edit_file`, or SEARCH/REPLACE `<edit>` blocks in Fast mode)
+  instead of whole files, and a new version that drops more than about a third of a file is not saved: the model is
+  told what it touched and tries again. A failed edit gets the closest lines of the file; only after two tries may a
+  single file be given whole. "Rewrite it" / "from scratch" lifts the limit.
+- **New features in steps** (Fast mode): a short plan first (files, element ids, what must work), shown in the chat,
+  then one file per request with the plan and the files already written in view. `localAI.confirmPlan` waits for your
+  OK or your changes to the plan.
+- **Thinking follows the request**: little for questions, more for corrections, the most for new features.
+- Models without a thinking phase write with a low temperature again; small models get a leaner prompt.
+- New checks: a page that does not load its script, `onclick` handlers the page cannot reach (defined inside another
+  function), and ids from the plan that are missing. Buttons handled by a shared selector (`button[data-value]`) or
+  by event delegation are no longer reported as doing nothing.
+- A path that starts with the project folder's own name is understood.
+- `npm run eval`: typical requests (new calculator and todo list, colour, heading, a new button, a bug fix, a rename,
+  a question) run against a live Ollama model and are checked in a browser engine (jsdom), with time and the share of
+  old code lost.
 - Fewer settings. Removed: Response mode and its Custom values (temperature, top-p, top-k, repeat penalty; answers always
   use the precise preset, the most reliable for code and tools), GPU layers (Ollama decides), `multiAgent` (the work mode
   decides about helper agents), "Send active file" (the open file is already shown to the model) and the unused

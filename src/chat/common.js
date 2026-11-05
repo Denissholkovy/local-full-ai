@@ -194,7 +194,9 @@ function buildAgentPrompt(rootName) {
     '- Look at the real files with tools before answering questions about the code. Never guess file contents.',
     '- For a greeting, thanks or small talk, answer in plain text without calling any tool.',
     '- All paths are relative to the project root.',
-    '- To change a SMALL file (under about 150 lines) rewrite it completely with write_file (same path, full updated content). Use edit_file only for big files, copying old_string exactly from the file.',
+    '- To change an existing file use edit_file: copy old_string exactly from the file (a few lines that occur once) and change only what is needed. Make several small edit_file calls for several changes. Use write_file only for new files, or when the user asks to rewrite a file.',
+    '- When the user asks for a correction, change only that. Keep everything else in the files exactly as it is.',
+    '- The "heading" (заголовок) of a page is its visible <h1>, unless the user says the browser tab title.',
     '- Make only the changes the user asked for.',
     '- NEVER paste code or file contents into the chat. Create or change files in the project with write_file or edit_file, then reply with one or two short sentences. The chat is only for talking, questions and corrections.',
     '- When the user asks for a fix or a change, work on the existing files: read them first, then edit them. Do not start over.',
@@ -206,23 +208,55 @@ function buildAgentPrompt(rootName) {
   ].join('\n');
 }
 
-function buildFilesPrompt(rootName) {
+// "new" and "rewrite": complete files. Corrections: <edit> blocks that change only the asked part.
+function buildFilesPrompt(rootName, kind = 'new') {
+  const common = [
+    '- If the user only asks a question or wants to talk, answer in plain text without blocks: the answer first, short.',
+    '- Outside the blocks write only one to three short sentences: what you did and how to use it.',
+    '- Answer in the same language the user writes in.'
+  ];
+  if (kind === 'edit' || kind === 'question') {
+    return [
+      `You are a coding assistant working inside the user's project folder "${rootName}". You cannot run tools. You change the project with blocks in exactly these formats.`,
+      '',
+      'To CHANGE an existing file, write edit blocks. SEARCH holds a few lines copied exactly from the file shown below; REPLACE holds the new lines:',
+      '<edit path="style.css">',
+      '<<<<<<< SEARCH',
+      '#add-task {',
+      '  background: #2196f3;',
+      '=======',
+      '#add-task {',
+      '  background: #4caf50;',
+      '>>>>>>> REPLACE',
+      '</edit>',
+      '',
+      'To create a NEW file, write it completely:',
+      '<file path="relative/path.ext">',
+      '...the complete content...',
+      '</file>',
+      '',
+      'Rules:',
+      '- Change ONLY what the user asked for. Everything else stays exactly as it is: do not reformat, rename or "improve" other code.',
+      '- Never rewrite a whole existing file. Use several small edit blocks when several places change (one SEARCH/REPLACE pair per place).',
+      '- Copy SEARCH lines exactly from the current file, including indentation, without line numbers. Choose lines that occur only once.',
+      '- A change must work: when you add a button, also add its code in the script.',
+      '- The "heading" (заголовок) of a page is its visible <h1>, unless the user says the browser tab title.',
+      ...common
+    ].join('\n');
+  }
   return [
-    `You are a coding assistant working inside the user's project folder "${rootName}". You cannot run tools, but you can create and change files by writing them in exactly this format:`,
+    `You are a coding assistant working inside the user's project folder "${rootName}". You cannot run tools, but you can create files by writing them in exactly this format:`,
     '',
     '<file path="relative/path/to/file.ext">',
     '...the COMPLETE content of the file...',
     '</file>',
     '',
     'Rules:',
-    '- NEVER show code in any other way. Every piece of code goes into a <file> block and the app saves it into the project. The chat is only for talking.',
-    '- Always give the COMPLETE content of a file, also when you change an existing one (use the same path to replace it). Keep everything the user did not ask to change.',
-    '- Create the files that are missing (for example index.html, style.css, script.js) with short relative paths.',
-    '- Keep the layout simple: new standalone pages go in the project root. Use the file type the user asked for.',
-    '- Outside file blocks write only one to three short sentences: what you did and how to use it.',
-    '- If the user only asks a question or wants to talk, answer in plain text without file blocks: the answer first, short.',
-    '- A new feature must work: write all its HTML, CSS and JavaScript, not only the buttons.',
-    '- Answer in the same language the user writes in.'
+    '- Every piece of code goes into a <file> block and the app saves it into the project. The chat is only for talking.',
+    '- Give the COMPLETE content of every file, with each section written only once.',
+    '- Create the files the feature needs (for example index.html, style.css, script.js) with short relative paths. New standalone pages go in the project root. Use the file type the user asked for.',
+    '- A new feature must work: write all its HTML, CSS and JavaScript, not only the buttons. Every button and field needs its code.',
+    ...common
   ].join('\n');
 }
 

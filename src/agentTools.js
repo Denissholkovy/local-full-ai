@@ -347,6 +347,26 @@ function asksForFileContent(content) {
   return /(provide|share|send|show|paste|надайте|надішліть|покажіть|вставте|пришлите|предоставьте|покажите).{0,60}(content|contents|file|code|вміст|файл|код|содержим)/i.test(tail);
 }
 
+const QUESTION_START = /^(що|шо|як|чому|навіщо|де|коли|який|яка|яке|які|скільки|чи|поясни|розкажи|опиши|что|как|почему|зачем|где|объясни|расскажи|what|how|why|where|when|which|who|explain|describe|tell me|is|are|does|do|can)(?![\p{L}])/iu;
+const REWRITE_WORDS = /(перероби(ти)?\s+(все|усе|повністю)|з\s+нуля|перепиши|переписати|заміни\s+(все|усе)|переделай\s+(все|полностью)|с\s+нуля|rewrite|from\s+scratch|start\s+over|redo\s+(it|everything))/iu;
+
+// What the user wants from this message:
+// question = only an answer, new = build something (nothing to keep yet), edit = change existing code and keep
+// the rest, rewrite = the user asked to redo the code (no limit on how much may change).
+function requestKind(text, { hasProjectFiles = false } = {}) {
+  const t = String(text || '').trim();
+  if (!t) return 'question';
+  // "Чому не працює кнопка" is a bug report: the user wants it fixed, not explained.
+  const broken = /(не\s+працю|не\s+работа|не\s+спрацьов|не\s+рахує|не\s+считает|зламал|сломал|помилк|ошибк|баг\b|doesn'?t\s+work|not\s+working|broken|\bbug\b|\berror\b)/iu.test(t);
+  if (broken && hasProjectFiles && !/^(поясни|explain|объясни)/iu.test(t)) return REWRITE_WORDS.test(t) ? 'rewrite' : 'edit';
+  const asks = QUESTION_START.test(t) || /\?\s*$/.test(t);
+  if (asks && !TASK_PATTERN.test(t.replace(/\?\s*$/, ''))) return 'question';
+  if (asks && /\?\s*$/.test(t) && QUESTION_START.test(t)) return 'question';
+  if (REWRITE_WORDS.test(t)) return 'rewrite';
+  if (!hasProjectFiles) return 'new';
+  return 'edit';
+}
+
 function normalizeText(text) {
   return String(text || '').replace(/<think>[\s\S]*?<\/think>/g, '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 }
@@ -377,6 +397,7 @@ function looksLikeToolAttempt(content) {
 }
 
 module.exports = {
+  requestKind,
   repeatsText,
   briefProblem,
   formatBrief,

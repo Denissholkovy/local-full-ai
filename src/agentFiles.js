@@ -48,6 +48,33 @@ function dropFilenameLine(text) {
   return lines.join('\n');
 }
 
+const EDIT_BLOCK = /<edit\s+path=["']([^"']+)["']\s*>([\s\S]*?)(?:<\/edit>|$)/g;
+const SEARCH_REPLACE = /<{5,9}\s*SEARCH[^\n]*\n([\s\S]*?)\n?={5,9}[^\n]*\n([\s\S]*?)\n?>{5,9}\s*REPLACE/g;
+
+// Line numbers the model may copy from an error message ("12| code") are not part of the code.
+function dropLineNumbers(text) {
+  const lines = text.split('\n');
+  const numbered = lines.filter((l) => l.trim()).every((l) => /^\s*\d+\s*[|:]\s?/.test(l));
+  return numbered ? lines.map((l) => l.replace(/^\s*\d+\s*[|:]\s?/, '')).join('\n') : text;
+}
+
+// <edit path="..."> blocks with SEARCH / REPLACE parts: targeted changes instead of whole files.
+// Returns the edits and the content without those blocks (for <file> blocks and the short reply).
+function extractEdits(content) {
+  const edits = [];
+  const rest = String(content || '').replace(EDIT_BLOCK, (_all, rawPath, body) => {
+    const clean = cleanPath(rawPath);
+    if (!clean) return '';
+    let m;
+    SEARCH_REPLACE.lastIndex = 0;
+    while ((m = SEARCH_REPLACE.exec(body)) !== null) {
+      edits.push({ path: clean, search: dropLineNumbers(m[1]), replace: m[2] });
+    }
+    return '';
+  });
+  return { edits, rest };
+}
+
 function extractFiles(content) {
   const files = [];
   const used = new Set();
@@ -110,4 +137,4 @@ function hasCodeDump(content) {
   return false;
 }
 
-module.exports = { extractFiles, hasCodeDump, stripLongCode };
+module.exports = { extractFiles, extractEdits, hasCodeDump, stripLongCode };

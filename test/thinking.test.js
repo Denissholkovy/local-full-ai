@@ -18,14 +18,23 @@ test('think:false only goes to models that can switch thinking off', () => {
   settings.thinking = undefined;
 });
 
-test('thinking budgets: short for small models, none for deep', () => {
-  assert.strictEqual(generation.thinkBudget('qwen3:4b'), 4000);
-  assert.strictEqual(generation.thinkBudget('qwen3:32b'), 16000);
+test('thinking budgets follow the request and the model size', () => {
+  assert.strictEqual(generation.thinkBudget('qwen3:4b', 'question'), 1500);
+  assert.strictEqual(generation.thinkBudget('qwen3:4b', 'edit'), 3000);
+  assert.strictEqual(generation.thinkBudget('qwen3:4b', 'new'), 12000);
+  assert.strictEqual(generation.thinkBudget('qwen3:4b'), 3000);
+  assert.strictEqual(generation.thinkBudget('qwen3:32b', 'new'), 24000);
   settings.thinking = 'deep';
-  assert.strictEqual(generation.thinkBudget('qwen3:4b'), 0);
+  assert.strictEqual(generation.thinkBudget('qwen3:4b', 'new'), 0);
   settings.thinking = 'fast';
-  assert.strictEqual(generation.thinkBudget('qwen3:32b'), 1500);
+  assert.strictEqual(generation.thinkBudget('qwen3:32b', 'new'), 1500);
   settings.thinking = undefined;
+});
+
+test('models without thinking get a low temperature, thinking models keep their own', () => {
+  assert.deepStrictEqual(generation.samplingFor(false), { temperature: 0.2, top_p: 0.9 });
+  assert.deepStrictEqual(generation.samplingFor(true), {});
+  assert.deepStrictEqual(generation.samplingFor(null), {});
 });
 
 test('sampling is left to the model', () => {

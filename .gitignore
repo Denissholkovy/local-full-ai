@@ -2,3 +2,4 @@ node_modules/
 .claude
 *.vsix
 .DS_Store
+eval/results/

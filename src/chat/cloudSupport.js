@@ -57,8 +57,8 @@ module.exports = {
       numCtx: this._contextSize(modelName),
       think: capabilities.localCap(modelName, 'thinking') ? generationLib.think(modelName, capabilities.canSwitchThinking(modelName)) : undefined,
       canThink: capabilities.localCap(modelName, 'thinking') === true,
-      thinkBudget: generationLib.thinkBudget(modelName),
-      generation: generationLib.options()
+      thinkBudget: generationLib.thinkBudget(modelName, extra && extra.kind),
+      generation: generationLib.samplingFor(capabilities.localCap(modelName, 'thinking'))
     };
   },
 

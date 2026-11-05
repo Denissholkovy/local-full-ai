@@ -44,12 +44,26 @@ function think(modelName, canSwitch) {
 }
 
 // How much thinking (in characters, about 4 per token) before the model is told to answer. 0 = no limit.
-function thinkBudget(modelName) {
+// It follows the request: a question needs little, a correction some, a new feature the most.
+// "plan" is the thinking before a feature built in steps; each "step" (one file) then needs little more.
+const BUDGETS = {
+  small: { question: 1500, edit: 3000, new: 12000, rewrite: 12000, plan: 6000, step: 2500 },
+  big: { question: 4000, edit: 8000, new: 24000, rewrite: 24000, plan: 16000, step: 6000 }
+};
+
+function thinkBudget(modelName, kind = 'edit') {
   const mode = thinkingMode();
   if (mode === 'deep') return 0;
   if (mode === 'fast') return 1500;
   const size = billions(modelName);
-  return size > 0 && size < 13 ? 4000 : 16000;
+  const table = size > 0 && size < 13 ? BUDGETS.small : BUDGETS.big;
+  return table[kind] || table.edit;
+}
+
+// Models without a thinking phase write more exact code with little randomness; thinking models keep their own
+// settings (a low temperature makes them loop).
+function samplingFor(thinks) {
+  return thinks === false ? { temperature: 0.2, top_p: 0.9 } : {};
 }
 
 function summary() {
@@ -64,4 +78,4 @@ function summary() {
   };
 }
 
-module.exports = { THINKING, options, summary, thinkingMode, think, thinkBudget };
+module.exports = { THINKING, options, summary, thinkingMode, think, thinkBudget, samplingFor };

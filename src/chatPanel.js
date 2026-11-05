@@ -7,6 +7,10 @@ const problems = require('./problems');
 const webFetch = require('./webFetch');
 const usageStats = require('./usageStats');
 const { stripLeakedThinking } = require('./ollamaClient');
+const { rewriteProblem } = require('./tools');
+
+// A change that could not be saved goes back to the model this many times.
+const MAX_SAVE_RETRIES = 2;
 
 // From this many source files on, helper agents are offered for tasks (counting stops there).
 const BIG_PROJECT_FILES = 60;
@@ -248,10 +252,10 @@ class ChatPanel {
   _addModelNotice(session, previous, current) {
     const running = this._runs.has(session.id);
     let text = current
-      ? `Model changed: ${previous || 'none'} \u2192 ${current}`
+      ? `Model changed: ${previous || 'none'} \u2192 ${current}.`
       : `Model removed (was ${previous || 'none'}). Pick a model to continue.`;
     if (current && !modelSupportsTools(current) && this._context.globalState.get('localAI.agentEnabled', true)) {
-      text += ' (this model cannot use tools: it saves code into your project files but cannot read them on its own)';
+      text += ' This model cannot use tools: it saves code into your project files but cannot read them on its own.';
     }
     const goesTo = current && consent.destination(current);
     if (current && cloud.isLocalServer(current)) {
@@ -261,7 +265,7 @@ class ChatPanel {
     } else if (previous && consent.destination(previous)) {
       text += ' Back to a local model: nothing leaves your computer.';
     }
-    if (running) text += ' - takes effect from your next message';
+    if (running) text += ' It takes effect from your next message.';
     session.history.push({ role: 'notice', content: text });
     session.lastModel = current;
     this._persistSessions(session);
@@ -455,6 +459,10 @@ class ChatPanel {
       workMode: (this._currentSession() || {}).lastProfile || null,
       cloudLimits: modelName && cloud.isCloudModel(modelName) ? this._limitsMessage(modelName, cloudLimits.get((cloud.parseName(modelName) || {}).providerId, (cloud.parseName(modelName) || {}).modelId)) : null,
       workspaceName: root ? path.basename(root) : null,
+      projectEmpty: (() => {
+        const tools = root && workspaceLib.isTrusted() ? this._getTools() : null;
+        return tools ? tools.countSourceFiles(BIG_PROJECT_FILES) === 0 : null;
+      })(),
       agentEnabled: this._context.globalState.get('localAI.agentEnabled', true),
       trusted: workspaceLib.isTrusted(),
       permissionMode: this._context.globalState.get('localAI.permissionMode', 'ask'),
@@ -659,6 +667,33 @@ class ChatPanel {
 
   // Helpers cost a lot of time (each starts from an empty context), so the model only gets them when they pay off:
   // the user asked for them, autopilot works on a big task, or the project is large.
+  // Names this change stopped defining while the file or the project's other code still uses them.
+  _orphans(tools, relPath, before) {
+    const after = tools.snapshot(relPath);
+    if (after === null) return [];
+    const self = tools.relative(tools.resolve(relPath));
+    const others = tools.listSourceFiles(40)
+      .filter((rel) => rel !== self && /\.(html?|m?js|cjs|jsx|ts|tsx)$/i.test(rel))
+      .map((rel) => ({ rel, text: tools.snapshot(rel) || '' }));
+    return projectCheck.orphanNames(self, before, after, others);
+  }
+
+  // Why a change to an existing file must be undone right away, or null.
+  // `original` is the file as it was before this request: controls the model added itself may go again.
+  _harmfulChange(run, relPath, before, after, original = before) {
+    if (after === null) return null;
+    const rel = String(relPath || '');
+    if (/\.(m?js|cjs)$/i.test(rel) && !projectCheck.syntaxIssue(rel, before)) {
+      const broken = projectCheck.syntaxIssue(rel, after);
+      if (broken) return `it makes a syntax error (${broken.replace(`${rel}: `, '')}). Check the brackets and that old_string covers whole statements, then try again.`;
+    }
+    if (/\.html?$/i.test(rel) && run.kind === 'edit') {
+      const removed = original ? projectCheck.removedControls(original, after, run.task) : null;
+      if (removed) return removed;
+    }
+    return null;
+  }
+
   // The latest assistant text since the user's last own message (answers to earlier questions do not count).
   _lastAnswerThisTurn(history) {
     for (let i = history.length - 1; i >= 0; i--) {
@@ -706,8 +741,10 @@ class ChatPanel {
         if (memory) late.push(memory);
       }
     } else if (ctx.filesMode) {
-      parts.push(buildFilesPrompt(path.basename(tools.root)));
-      late.push(`Folders you may use:\n${tools.accessSummary()}\n\nProject structure:\n${tools.overview()}`);
+      parts.push(buildFilesPrompt(path.basename(tools.root), ctx.run.kind));
+      // Small models do better with less around the task: one folder needs no access list, and a shallow tree is enough.
+      const oneFolder = (tools.policy.roots || []).length <= 1 && !(tools.policy.rules || []).length;
+      late.push(`${oneFolder ? '' : `Folders you may use:\n${tools.accessSummary()}\n\n`}Project structure:\n${tools.overview(40, 2)}`);
       const current = this._filesContext(ctx);
       if (current) late.push(current);
     } else {
@@ -719,9 +756,11 @@ class ChatPanel {
         late.push(`Files you created or changed in this chat (continue from them when the user asks for corrections): ${ctx.session.writtenFiles.join(', ')}`);
       }
       if (tools) {
-        const memory = tools.readMemory(ctx.compact ? 700 : 2000);
+        const lean = ctx.compact || ctx.profile !== 'agent';
+        const memory = tools.readMemory(lean ? 800 : 2000);
         if (memory) late.push(memory);
-        if (!ctx.compact) {
+        // On a small project the files themselves are shown, so the map would only repeat them.
+        if (!ctx.compact && (ctx.profile === 'agent' || tools.countSourceFiles(BIG_PROJECT_FILES) >= 15)) {
           const map = tools.symbolMap(1400);
           if (map) late.push(`Where things are defined (file: functions, classes, element ids):\n${map}`);
         }
@@ -891,15 +930,10 @@ class ChatPanel {
     if (tools) run.problemsBefore = problems.collect(tools.root, { errorsOnly: true, limit: 500 });
     const mcp = agentEnabled && nativeTools && tools ? await this._mcpTools() : null;
     const filesMode = agentEnabled && !nativeTools && !!tools;
+    run.kind = agentTools.requestKind(run.task, { hasProjectFiles: !!tools && tools.countSourceFiles(BIG_PROJECT_FILES) > 0 });
     if (session.lastProfile !== profile.mode && tools) {
       session.lastProfile = profile.mode;
       this._sendModelInfo();
-      const text = {
-        direct: `Fast mode (${profile.reason}): the model gets the relevant files and answers in one pass, without a tool loop.`,
-        standard: `Standard mode (${profile.reason}): the model works with tools and a short plan, without helper agents.`,
-        agent: `Agent mode (${profile.reason}): full tool loop, with helper agents for big jobs.`
-      }[profile.mode];
-      this._postFor(session, { type: 'notice', text });
     }
     const skills = agentOn && !isSmallModel(modelName) ? this._skills() : [];
     const autoSkills = this._pickAutoSkills(session, run.task, modelName, nativeTools);
@@ -934,7 +968,8 @@ class ChatPanel {
 
     try {
       await this._maybeCompact(ctx);
-      await this._agentLoop(ctx);
+      const built = this._stepwiseWanted(ctx) && (await this._buildInSteps(ctx));
+      if (!built) await this._agentLoop(ctx);
       if (!run.stopped && ctx.tools && run.changes.size) await this._verifyAndFix(ctx);
       if (autopilot && ctx.filesMode && !run.stopped) run.finished = true;
     } finally {
@@ -972,12 +1007,13 @@ class ChatPanel {
             post({ type: 'assistantToken', text: token });
           },
           this._modelOptions(ctx.modelName, {
+            kind: ctx.run.kind,
             onAbortReady: (abortFn) => {
               run.aborts.add(abortFn);
               ctx.currentAbort = abortFn;
             },
             tools: defs,
-            onNotice: (text) => post({ type: 'contextTrimmed', text }),
+            onNotice: (text, important) => post({ type: important ? 'contextTrimmed' : 'status', text }),
             onLimits: (seen) => this._postFor(ctx.session, this._limitsMessage(ctx.modelName, seen)),
             onThinking: () => ctx.ui && post({ type: 'assistantThinking' }),
             onStats: (stats) => {
@@ -1004,7 +1040,7 @@ class ChatPanel {
           post({ type: 'assistantStart', modelName: ctx.modelName, supportsVision: isVisionModel(ctx.modelName), hideCode: !!(ctx.filesMode || (ctx.toolsEnabled && ctx.tools)) });
         }
         post({
-          type: 'contextTrimmed',
+          type: 'status',
           text: `Model error (${err.message}). Retrying ${attempt}/${maxAttempts - 1}...`
         });
         await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * (refused ? 2 : 1)));
@@ -1041,7 +1077,7 @@ class ChatPanel {
       const { messages, trimmed } = this._buildMessages(ctx);
       if (trimmed && ctx.ui) {
         post({
-          type: 'contextTrimmed',
+          type: 'status',
           text: 'This conversation got long - older messages were trimmed to fit the model\'s context window.'
         });
       }
@@ -1106,14 +1142,20 @@ class ChatPanel {
       if (ctx.filesMode && !run.stopped && toolCalls.length === 0) {
         const saved = await this._saveCodeAsFiles(ctx, content);
         // A file that could not be saved (for example a page written twice) gets one more try with the reason.
-        if (saved !== null && (run.saveErrors || []).length && saveRetries < 1 && !run.stopped) {
+        // What could not be saved goes back to the model with the reason: first as is, then with a simpler way out.
+        if (saved !== null && (run.saveErrors || []).length && saveRetries < MAX_SAVE_RETRIES && !run.stopped) {
           saveRetries++;
-          fakeUser(`[system] These files were NOT saved:\n${run.saveErrors.join('\n')}\nGive the complete corrected files again in <file path="..."> blocks.`);
+          const how = run.kind === 'edit'
+            ? (saveRetries === 1
+              ? 'Fix these blocks: copy SEARCH lines exactly from the current file, change only what was asked.'
+              : 'If an edit block still does not match, give that one file completely in a <file> block, keeping every part the user did not ask to change exactly as it is.')
+            : 'Give the complete corrected files again in <file path="..."> blocks.';
+          fakeUser(`[system] These changes were NOT saved:\n${run.saveErrors.join('\n')}\n${how}`);
           ctx.persist();
           continue;
         }
         if (saved !== null) return saved;
-        if (agentTools.looksLikeTask(run.task) && !agentTools.endsWithQuestion(content) && dumpNudges < MAX_DUMP_NUDGES) {
+        if (run.kind !== 'question' && agentTools.looksLikeTask(run.task) && !agentTools.endsWithQuestion(content) && dumpNudges < MAX_DUMP_NUDGES) {
           dumpNudges++;
           if (ctx.ui) post({ type: 'assistantDiscard' });
           fakeUser('[system] Do not explain how to do it. Output the complete files now, each in a <file path="..."> block, and add one or two short sentences.');
@@ -1128,7 +1170,7 @@ class ChatPanel {
       const hasFiles = (ctx.session.writtenFiles || []).length > 0;
       const asksContent = agentTools.asksForFileContent(content);
       const isQuestion = agentTools.endsWithQuestion(content) && !asksContent;
-      const shouldAct =
+      const shouldAct = run.kind !== 'question' &&
         (agentTools.looksLikeTask(run.task) || agentTools.looksLikeFollowUpEdit(run.task, hasFiles)) &&
         (!isQuestion || dumpNudges === 0);
       const needsDelegate =
@@ -1141,17 +1183,17 @@ class ChatPanel {
         if (dumpNudges < MAX_DUMP_NUDGES) {
           dumpNudges++;
           if (ctx.ui) post({ type: 'assistantDiscard' });
-          let message = '[system] Do not explain how to do it, do not ask the user to do it and do not ask which action to take: the request is clear. If you truly need information, call ask_user. Otherwise do the task yourself now: call write_file to create or replace a file, or edit_file to change an existing one, in the project folder. Then reply with one or two short sentences.';
+          let message = '[system] Do not explain how to do it, do not ask the user to do it and do not ask which action to take: the request is clear. If you truly need information, call ask_user. Otherwise do the task yourself now: call edit_file to change an existing file (only the part that needs to change), or write_file to create a new file, in the project folder. Then reply with one or two short sentences.';
           if (agentTools.looksLikeToolAttempt(content)) {
-            message = '[system] You wrote a tool call as text. Do not write JSON in your reply: call the tool function itself (write_file with "path" and "content"). Do it now.';
+            message = '[system] You wrote a tool call as text. Do not write JSON in your reply: call the tool function itself (edit_file for an existing file, write_file for a new one). Do it now.';
           } else if (agentFiles.hasCodeDump(content)) {
-            message = '[system] Do not paste code into the chat. Put it into the project files: call write_file to create or replace a file, or edit_file to change an existing one. Then reply with one or two short sentences. Do it now.';
+            message = '[system] Do not paste code into the chat. Put it into the project files: call edit_file to change an existing file (only the part that needs to change), or write_file to create a new file. Then reply with one or two short sentences. Do it now.';
           }
           if (needsDelegate) {
             message = '[system] The user asked for helper agents. Call the delegate_task tool now, once per helper, with a full brief: a short "title", the "goal", the relevant "files", what is already "known", the "deliverable" you need, and mode "research". Do not just say that you will; make the calls. After their reports arrive, summarize them.';
           }
           if (asksContent) {
-            message = '[system] Do not ask the user for the file content: you can read it yourself with read_file (or it is shown in your instructions). Read it if needed, then change the file with write_file (full updated content). Do it now.';
+            message = '[system] Do not ask the user for the file content: you can read it yourself with read_file (or it is shown in your instructions). Read it if needed, then change it with edit_file (only the part that needs to change). Do it now.';
           }
           fakeUser(message + (run.lang && run.lang !== 'English' ? ` Reply to the user in ${run.lang}.` : ''));
           ctx.persist();
@@ -1216,7 +1258,7 @@ class ChatPanel {
           }Keep working with tools. When everything is done and verified, call finish_task.`
         );
         ctx.persist();
-        post({ type: 'contextTrimmed', text: `Autopilot: continuing the task (${nudges}/${MAX_NUDGES})...` });
+        post({ type: 'status', text: `Autopilot: continuing the task (${nudges}/${MAX_NUDGES})...` });
         continue;
       }
       nudges = 0;
@@ -1451,11 +1493,24 @@ class ChatPanel {
           const existedBefore = name === 'write_file' && args.path ? fs.existsSync(tools.resolve(args.path)) : true;
           const isEdit = (name === 'write_file' || name === 'edit_file') && args.path;
           const beforeText = isEdit ? tools.snapshot(args.path) : null;
+          // A correction must not turn into a rewrite of the whole file.
+          if (name === 'write_file' && beforeText !== null && run.kind === 'edit') {
+            const tooMuch = rewriteProblem(beforeText, String(args.content || ''));
+            if (tooMuch) throw new Error(tooMuch);
+          }
           output = await tools.run(name, args);
           const broke = isEdit ? this._removedStillUsed(tools, args.path, beforeText) : null;
           if (broke) {
             fs.writeFileSync(tools.resolve(args.path), beforeText);
             throw new Error(`This change was undone: it removed ${broke.join(', ')}, which the project still uses. Keep the existing code. For a small change use edit_file; with write_file give the COMPLETE file including the existing functions.`);
+          }
+          // A correction must not break a working file or take away its buttons: such a change is undone at once,
+          // before the model builds more edits on top of it.
+          const original = run.changes.has(tools.resolve(args.path)) ? run.changes.get(tools.resolve(args.path)).before : beforeText;
+          const undoReason = isEdit && beforeText !== null ? this._harmfulChange(run, args.path, beforeText, tools.snapshot(args.path), original) : null;
+          if (undoReason) {
+            fs.writeFileSync(tools.resolve(args.path), beforeText);
+            throw new Error(`Not saved, the file is unchanged: ${undoReason}`);
           }
           if (isEdit) {
             const afterText = tools.snapshot(args.path);
@@ -1468,10 +1523,14 @@ class ChatPanel {
               run.changes.get(abs).after = afterText;
             }
           }
+          if (isEdit && beforeText !== null && /\.(m?js|cjs|jsx|ts|tsx)$/i.test(String(args.path))) {
+            const orphans = this._orphans(tools, args.path, beforeText);
+            if (orphans.length) output += `\n\nNot finished: ${orphans.join('; ')}. Change those places too (edit_file with "replace_all": true renames every occurrence).`;
+          }
           if (name === 'write_file' && !existedBefore) this._revealFile(tools, args.path);
           if (name === 'write_file' || name === 'edit_file') {
             this._rememberFile(ctx.session, tools.relative(tools.resolve(args.path)));
-            if (/\.(html?|m?js)$/i.test(String(args.path || ''))) {
+            if (/\.(html?|m?js)$/i.test(String(args.path || '')) && !run.stepwise) {
               const found = projectCheck.format(projectCheck.run(tools));
               if (found) output += `\n\nAutomatic check after this change found problems in the project:\n${found}\nFix the ones that relate to the task.`;
             }
@@ -1480,6 +1539,17 @@ class ChatPanel {
       } catch (err) {
         ok = false;
         output = `Error: ${err.message}`;
+        // The same failing edit again: the excerpt did not help, so show the whole file this time.
+        if (name === 'edit_file' && tools && args.path && /was not found/.test(err.message)) {
+          const key = `${args.path}\n${args.old_string}`;
+          run.failedEdits = run.failedEdits || new Map();
+          const times = (run.failedEdits.get(key) || 0) + 1;
+          run.failedEdits.set(key, times);
+          const whole = times > 1 ? tools.snapshot(args.path) : null;
+          if (whole !== null) {
+            output = `Error: you sent this same old_string before and it is still not in ${args.path}. Here is the WHOLE file (line numbers are not part of the code):\n${truncate(whole.split('\n').map((l, i) => `${String(i + 1).padStart(4)}| ${l}`).join('\n'), 9000)}\nPick old_string from these exact lines, or read the file again with read_file.`;
+          }
+        }
       }
     }
 
@@ -1647,7 +1717,7 @@ class ChatPanel {
   }
 }
 
-for (const mixin of ['subagents', 'voiceInput', 'attachments', 'cloudSupport', 'filesMode', 'changes', 'verify', 'compact', 'images', 'semantic', 'mcpTools', 'profile']) {
+for (const mixin of ['subagents', 'voiceInput', 'attachments', 'cloudSupport', 'filesMode', 'changes', 'verify', 'compact', 'images', 'semantic', 'mcpTools', 'profile', 'stepwise']) {
   Object.assign(ChatPanel.prototype, require(`./chat/${mixin}`));
 }
 

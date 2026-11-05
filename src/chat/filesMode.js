@@ -4,8 +4,10 @@ const { vscode, fs, path, truncate, agentTools, agentFiles, CONTEXT_FILE_CHARS, 
 module.exports = {
   async _saveCodeAsFiles(ctx, content) {
     const { history, post, run } = ctx;
-    const parsed = agentFiles.extractFiles(content);
-    if (parsed.files.length === 0) return null;
+    const { edits, rest } = agentFiles.extractEdits(content);
+    const parsed = agentFiles.extractFiles(rest);
+    if (parsed.files.length === 0 && edits.length === 0) return null;
+    if (!parsed.files.length) parsed.trailing = parsed.text;
     run.saveErrors = [];
     if (parsed.trailing) {
       history.push({ role: 'assistant', content: parsed.trailing });
@@ -14,6 +16,29 @@ module.exports = {
     if (ctx.ui) {
       post({ type: 'assistantReplace', text: parsed.trailing });
       post({ type: 'assistantEnd' });
+    }
+    // Targeted changes first, so a whole-file block for the same file (if any) still sees the result.
+    for (const change of edits) {
+      if (run.stopped) break;
+      if (!change.search.trim()) {
+        run.saveErrors.push(`${change.path}: the SEARCH part is empty. Copy a few existing lines of the file into SEARCH.`);
+        continue;
+      }
+      const result = await this._executeToolCall(
+        { function: { name: 'edit_file', arguments: { path: change.path, old_string: change.search, new_string: change.replace } } },
+        ctx
+      );
+      history.push({
+        role: 'step',
+        name: 'edit_file',
+        path: change.path,
+        ok: result.ok,
+        denied: !!result.denied,
+        output: truncate(result.output, 400),
+        diff: capDiff(result.diff)
+      });
+      if (!result.ok && !result.denied) run.saveErrors.push(`${change.path}: ${String(result.output).replace(/^Error:\s*/, '')}`);
+      ctx.persist();
     }
     for (const file of parsed.files) {
       if (run.stopped) break;
@@ -42,7 +67,7 @@ module.exports = {
     post({ type: 'notice', text: 'The model did not edit the files by itself, so I am asking it to write the full files directly...' });
     const langHint = run.lang && run.lang !== 'English' ? ` Write the short text in ${run.lang}.` : '';
     const system = [
-      buildFilesPrompt(path.basename(tools.root)),
+      buildFilesPrompt(path.basename(tools.root), run.kind),
       `Folders you may use:\n${tools.accessSummary()}\n\nProject structure:\n${tools.overview()}`,
       this._filesContext(ctx),
       ctx.autoSkillsText,
@@ -55,6 +80,7 @@ module.exports = {
     let result;
     try {
       result = await this._clientFor(ctx.modelName).chatStream(ctx.modelName, messages, () => {}, this._modelOptions(ctx.modelName, {
+        kind: run.kind,
         onAbortReady: (abortFn) => run.aborts.add(abortFn)
       }));
     } catch (_) {

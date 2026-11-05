@@ -58,7 +58,7 @@ module.exports = {
     const index = this._semanticIndex(ctx.embedModel);
     const state = await index.update(ctx.tools, {
       budgetMs: INDEX_BUDGET_MS,
-      onProgress: (done, total) => ctx.ui && ctx.post({ type: 'contextTrimmed', text: `Indexing the project for meaning search: ${done} of ${total} files...` })
+      onProgress: (done, total) => ctx.ui && ctx.post({ type: 'status', text: `Indexing the project for meaning search: ${done} of ${total} files...` })
     });
     const limit = Math.min(20, Math.max(1, Number(args.limit) || 8));
     const hits = await index.search(ctx.tools, args.query, limit);

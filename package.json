@@ -2,27 +2,27 @@
   "name": "local-full-ai",
   "displayName": "Local Full AI",
   "publisher": "Denys-Shovkovyi",
-  "description": "A private AI coding assistant for VS Code, powered by local Ollama models, with optional free cloud models when local ones are too weak: chat, edit your project with approval, autopilot, helper agents, voice input and model management.",
-  "version": "0.1.3",
+  "description": "Private AI coding assistant on local Ollama models: builds features and fixes bugs in your project with targeted edits, checks its own work, adapts to small and large models. Optional free cloud models.",
+  "version": "0.2.0",
   "license": "MIT",
   "icon": "media/icon.png",
   "keywords": [
-    "agent",
     "ai",
-    "autopilot",
-    "chat",
-    "coding assistant",
-    "gemini",
-    "groq",
-    "llm",
+    "ollama",
     "local",
     "offline",
-    "ollama",
-    "openrouter",
     "private",
+    "coding assistant",
+    "chat",
+    "agent",
+    "llm",
     "qwen",
-    "skills",
-    "whisper"
+    "autopilot",
+    "code completion",
+    "groq",
+    "openrouter",
+    "gemini",
+    "code assistant"
   ],
   "repository": {
     "type": "git",
@@ -32,9 +32,10 @@
     "vscode": "^1.85.0"
   },
   "categories": [
-    "Other",
-    "Machine Learning",
-    "Programming Languages"
+    "AI",
+    "Chat",
+    "Programming Languages",
+    "Machine Learning"
   ],
   "activationEvents": [],
   "main": "./src/extension.js",
@@ -271,6 +272,11 @@
           "default": "auto",
           "description": "How the AI works on your project. Auto picks from the model's size and its measured speed on this computer."
         },
+        "localAI.confirmPlan": {
+          "type": "boolean",
+          "default": false,
+          "description": "Fast mode: show the plan of a new feature and wait for your OK (or your changes) before the code is written."
+        },
         "localAI.subagentModel": {
           "type": "string",
           "default": "",
@@ -352,10 +358,12 @@
     "test": "node --test test/",
     "package": "vsce package --no-dependencies",
     "release:patch": "npm version patch -m \"Release %s\" && git push --follow-tags",
-    "release:minor": "npm version minor -m \"Release %s\" && git push --follow-tags"
+    "release:minor": "npm version minor -m \"Release %s\" && git push --follow-tags",
+    "eval": "node eval/run.js"
   },
   "devDependencies": {
-    "@types/vscode": "^1.85.0"
+    "@types/vscode": "^1.85.0",
+    "jsdom": "^26.1.0"
   },
   "homepage": "https://github.com/Denissholkovy/local-full-ai#readme",
   "bugs": {

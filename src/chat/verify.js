@@ -58,12 +58,19 @@ module.exports = {
         .slice(0, 20);
       if (reported.length) problems.push(`Errors reported by VS Code:\n${reported.join('\n')}`);
     }
+    for (const c of changes) {
+      if (c.binary || c.before === null || !/\.(m?js|cjs|jsx|ts|tsx)$/i.test(c.rel) || !fs.existsSync(c.abs)) continue;
+      this._orphans(ctx.tools, c.rel, c.before).forEach((o) => problems.push(`${c.rel}: ${o}. Change those places too.`));
+    }
     const pages = changes.filter((c) => /\.html?$/i.test(c.rel) && fs.existsSync(c.abs));
     if (pages.length) {
       const code = projectCheck.scriptCode(ctx.tools);
       for (const c of pages) {
-        const dead = projectCheck.deadControls(c.before || '', fs.readFileSync(c.abs, 'utf8'), code);
+        const now = fs.readFileSync(c.abs, 'utf8');
+        const dead = projectCheck.deadControls(c.before || '', now, code);
         if (dead) problems.push(`${c.rel}: ${dead}`);
+        const removed = c.before && ctx.run.kind === 'edit' ? projectCheck.removedControls(c.before, now, ctx.run.task) : null;
+        if (removed) problems.push(`${c.rel}: ${removed}`);
       }
     }
     if (changes.some((c) => /\.(html?|m?js)$/i.test(c.rel))) {
@@ -131,21 +138,24 @@ module.exports = {
       }
 
       if (!problems.length) {
-        if (round > 1 || mode === 'full') post({ type: 'notice', text: mode === 'full' ? 'Checked by a reviewer agent: the changes look correct.' : 'Quick check passed: no syntax errors or broken links.' });
+        post({ type: 'checkResult', result: mode === 'full' ? 'reviewed' : 'passed', fixed: round > 1 });
         return;
       }
       if (round > MAX_FIX_ROUNDS) {
+        post({ type: 'checkResult', result: 'problems' });
         post({ type: 'notice', text: `The checks still report problems after ${MAX_FIX_ROUNDS} fixes. Please look at them:\n${truncate(problems.join('\n'), 1200)}` });
         return;
       }
       const snapshot = this._snapshotChanges(ctx);
       const before = await this._quickChecks(ctx);
-      post({ type: 'notice', text: `The check found problems, fixing them (round ${round} of ${MAX_FIX_ROUNDS})...` });
+      post({ type: 'status', text: `The check found problems, fixing them (round ${round} of ${MAX_FIX_ROUNDS})...` });
       history.push({
         role: 'user',
         synthetic: true,
-        content: ctx.filesMode
-          ? `[check] Your changes have these problems:\n${truncate(problems.join('\n'), 2500)}\n\nFix them: give the complete corrected files in <file path="..."> blocks (each section once, keep everything that works). Then reply in one or two short sentences.`
+        content: ctx.filesMode && run.kind !== 'edit'
+          ? `[check] The new files have these problems:\n${truncate(problems.join('\n'), 2500)}\n\nFix them: give each file that needs a change completely in a <file path="..."> block (or use <edit> blocks for small changes). Keep everything that works. Then reply in one or two short sentences.`
+          : ctx.filesMode
+          ? `[check] Your changes have these problems:\n${truncate(problems.join('\n'), 2500)}\n\nFix only these problems with <edit path="..."> blocks (SEARCH lines copied exactly from the current files, shown above). Keep everything that works. Then reply in one or two short sentences.`
           : `[check] Your changes have these problems:\n${truncate(problems.join('\n'), 2500)}\n\nFix only these problems with small edit_file changes; read the file first. Keep all existing code and functions that still work. Do not rewrite whole files. Then reply in one or two short sentences.`
       });
       ctx.persist();

@@ -459,7 +459,7 @@ class OllamaClient {
             if (cut >= 0 && !aborted) {
               fullText = fullText.slice(0, cut);
               aborted = true;
-              if (onNotice) onNotice('The model started repeating itself, so the answer was cut. This model is too weak for this task: pick a stronger one.');
+              if (onNotice) onNotice('The model started repeating itself, so the answer was cut. This model is too weak for this task: pick a stronger one.', true);
               if (reqRef) reqRef.destroy();
               finish();
               return;

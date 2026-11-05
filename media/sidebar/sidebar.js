@@ -18,6 +18,7 @@
   let cloudOpen = true;
   let mainTab = null;
   let providersOpen = false;
+  let advancedOpen = false;
   let othersOpen = false;
   let moreOpen = false;
   let welcomeDismissed = false;
@@ -51,12 +52,31 @@
   }
 
   // How much to trust a model with agent work (reading and editing the project), from its size and tool support.
-  function agentTag(sizeGB, hasTools) {
-    if (hasTools === false) return '<span class="tag warn" title="This model cannot call tools: it can only write code into files, not read or search your project.">no tools</span>';
-    if (!sizeGB) return '';
-    if (sizeGB < 3) return '<span class="tag warn" title="Very small: fine for chatting and tiny edits, unreliable for project work.">weak for agent</span>';
-    if (sizeGB < 6.5) return '<span class="tag" title="Small model: ok for simple tasks and short files, may claim to edit without doing it.">basic agent</span>';
-    return '<span class="tag ok" title="Large enough to work on a project reliably.">agent-ready</span>';
+  // Billions of parameters from Ollama's details ("7.6B") or the model name ("qwen2.5-coder:7b").
+  function billionsOf(name, params) {
+    const fromParams = String(params || '').match(/(\d+(?:\.\d+)?)\s*B/i);
+    if (fromParams) return Number(fromParams[1]);
+    const fromName = String(name || '').match(/(?:^|[:\-_/])(\d+(?:\.\d+)?)b(?:$|[-_:.])/i);
+    return fromName ? Number(fromName[1]) : 0;
+  }
+
+  // One plain-words verdict instead of technical tags: what the model is good for. It follows the number of
+  // parameters (a 7B model in 4-bit is only about 4.7 GB, so the file size would undersell it).
+  function agentTag(sizeGB, hasTools, billions) {
+    if (hasTools === false) return '<span class="tag warn" title="This model cannot call tools: it can only write code into files, not read or search your project.">chat only</span>';
+    const b = billions || (sizeGB ? sizeGB * 1.6 : 0);
+    if (!b) return '';
+    if (b < 4.5) return '<span class="tag warn" title="Very small: fine for chatting and tiny edits, unreliable for project work.">chat & small edits</span>';
+    if (b < 7) return '<span class="tag" title="Small model: ok for simple tasks and short files, may claim to edit without doing it.">simple tasks</span>';
+    return '<span class="tag ok" title="Large enough to work on a project reliably.">good for projects</span>';
+  }
+
+  function friendlyTags(tags) {
+    return (tags || []).includes('vision') ? ['sees images'] : [];
+  }
+
+  function techDetails(m, catalog) {
+    return [m.name, m.params, m.quant, ...((catalog && catalog.tags) || [])].filter(Boolean).join(' \u00b7 ');
   }
 
   function cloudTierTag(m) {
@@ -217,12 +237,11 @@
       ? metaHtml('', (catalog && catalog.tags) || [], '<span class="tag cloud-tag" title="Runs on ollama.com: your prompts leave this computer">cloud</span>')
       : embedder
         ? metaHtml(formatSize(m.sizeGB), [], '<span class="tag" title="Used for meaning search in the project, not for chatting">search model</span>')
-        : metaHtml(formatSize(m.sizeGB), [].concat(m.quant ? [m.quant] : [], (catalog && catalog.tags) || []), agentTag(m.sizeGB, catalog ? (catalog.tags || []).includes('tools') : undefined));
-    return '<div class="model-card' + (isActive ? ' active' : '') + '">' +
+        : metaHtml(formatSize(m.sizeGB), friendlyTags(catalog && catalog.tags), agentTag(m.sizeGB, catalog ? (catalog.tags || []).includes('tools') : undefined, billionsOf(m.name, m.params)));
+    return '<div class="model-card' + (isActive ? ' active' : '') + '" title="' + esc(techDetails(m, catalog)) + '">' +
       '<div class="card-main">' +
-        '<div class="card-title"><span class="model-name" title="' + esc(m.name) + '">' + esc(title) + '</span></div>' +
+        '<div class="card-title"><span class="model-name">' + esc(title) + '</span></div>' +
         meta +
-        '<div class="card-desc">' + esc(m.name) + '</div>' +
       '</div>' +
       '<div class="card-actions">' +
         (isActive
@@ -255,7 +274,7 @@
       '<div class="card-main">' +
         '<div class="card-title"><span class="model-name">' + esc(m.label) + '</span>' +
           (m.recommended ? '<span class="star" title="Recommended">&#9733;</span>' : '') + '</div>' +
-        metaHtml(formatSize(m.sizeGB), m.tags, fitTag(fit) + (m.category === 'vision' ? '' : agentTag(m.sizeGB, (m.tags || []).includes('tools')))) +
+        metaHtml(formatSize(m.sizeGB), friendlyTags(m.tags), fitTag(fit) + (m.category === 'vision' ? '' : agentTag(m.sizeGB, (m.tags || []).includes('tools'), billionsOf(m.name)))) +
         '<div class="card-desc">' + esc(m.description) + '</div>' +
       '</div>' +
       '<div class="card-actions">' +
@@ -466,15 +485,22 @@
     }
     const localDown = !m.cloud && state.view === 'notRunning';
     const cls = m.cloud ? 'cloud' : 'local';
-    const badge = m.cloud ? 'CLOUD &middot; ' + esc(m.where) : 'LOCAL &middot; this computer';
+    const badge = m.cloud ? 'Cloud &middot; ' + esc(m.where) : 'On this computer';
+    const installed = !m.cloud && Array.isArray(state.installed) ? state.installed.find((x) => x.name === state.selectedModel) : null;
+    const catalog = installed && state.catalog ? state.catalog.find((c) => c.name === installed.name) : null;
+    const facts = [];
+    if (installed) facts.push(formatSize(installed.sizeGB));
+    if (installed) facts.push(agentTag(installed.sizeGB, catalog ? (catalog.tags || []).includes('tools') : undefined, billionsOf(installed.name, installed.params)).replace(/^<span[^>]*>|<\/span>$/g, ''));
+    if (catalog && (catalog.tags || []).includes('vision')) facts.push('sees images');
     const hint = m.cloud
       ? 'Online. Your messages and the files it reads are sent to ' + esc(m.where) + '.'
       : localDown
         ? 'Ollama is not running. Start it in the <b>This computer</b> tab.'
         : 'Runs on this computer. Nothing leaves it.';
     return '<div class="active-card ' + cls + (localDown ? ' off' : '') + '">' +
-      '<div class="active-top"><span class="where-badge ' + cls + '">' + badge + '</span><span class="active-label">Active model</span></div>' +
-      '<div class="active-name" title="' + esc(m.label) + '">' + esc(m.label) + '</div>' +
+      '<div class="active-top"><span class="where-badge ' + cls + '">' + badge + '</span></div>' +
+      '<div class="active-name" title="' + esc(installed ? techDetails(installed, catalog) : m.label) + '">' + esc(catalog ? catalog.label : m.label) + '</div>' +
+      (facts.length ? '<div class="active-facts">' + facts.filter(Boolean).map((f) => '<span>' + f + '</span>').join(' &middot; ') + '</div>' : '') +
       '<div class="active-hint">' + hint + '</div>' +
     '</div>' +
     '<button class="btn primary" data-act="chat">' + icon('chat') + ' Open chat</button>';
@@ -509,10 +535,10 @@
     const installedNames = new Set(state.installed.map((m) => m.name));
     const active = state.installed.find((m) => m.name === state.selectedModel);
     const others = state.installed.filter((m) => m !== active);
-    if (active) html += installedRow(active);
     if (others.length > 0) {
-      html += toggleHtml('toggleOthersOpen', othersOpen || !active, active ? 'Other installed' : 'Installed', others.length);
-      if (othersOpen || !active) others.forEach((m) => { html += installedRow(m); });
+      const openList = othersOpen || !active || others.length <= 3;
+      html += toggleHtml('toggleOthersOpen', openList, active ? 'Other installed' : 'Installed', others.length);
+      if (openList) others.forEach((m) => { html += installedRow(m); });
     }
     if (state.installed.length === 0) html += '<div class="empty">No model installed yet. Open "Get more models" below.</div>';
 
@@ -578,40 +604,37 @@
     return '<button class="setting" data-act="' + act + '"><span>' + label + '</span><span class="value">' + esc(value) + '</span></button>';
   }
 
+  // The few settings people change, then the rest under "Advanced".
   function settingsHtml() {
     let html = '<div class="section-toggle" data-act="toggleSettings">' +
-      (settingsOpen ? icon('chevronDown') : icon('chevronRight')) + '<span>Settings (local and cloud)</span></div>';
+      (settingsOpen ? icon('chevronDown') : icon('chevronRight')) + '<span>Settings</span></div>';
     if (!settingsOpen) return html;
     const g = state.generation || {};
     const prompt = state.systemPrompt ? state.systemPrompt.slice(0, 40) + (state.systemPrompt.length > 40 ? '...' : '') : 'none';
-    html += '<div class="settings-group"><span class="scope-tag both">Both</span> work with any model</div>';
     html += '<div class="settings-box">';
-    html += scopeRow('System prompt', prompt, 'systemPrompt');
     html += scopeRow('Work mode', g.agentModeLabel || 'Auto', 'agentMode');
-    html += scopeRow('Reviewer model', g.reviewerLabel || '', 'reviewerModel');
-    html += scopeRow('Image generation', state.imageBackend || 'Off', 'imageBackend');
-    html += scopeRow('MCP servers', 'Manage...', 'manageMcp');
-    html += scopeRow('Usage statistics', 'Show...', 'usageStats');
+    html += scopeRow('System prompt', prompt, 'systemPrompt');
+    html += scopeRow('Code completion', state.autocomplete || 'Off', 'autocomplete');
     html += '<button class="setting" data-act="toggleFoldersOpen"><span>Folder access</span><span class="value">' + esc(foldersSummary()) + ' ' + (foldersOpen ? '&#9652;' : '&#9662;') + '</span></button>';
-    html += '<button class="setting" data-act="toggleSkillsOpen"><span>Claude skills</span><span class="value">' + esc(skillsSummary()) + ' ' + (skillsOpen ? '&#9652;' : '&#9662;') + '</span></button>';
     html += '<button class="setting" data-act="toggleVoiceOpen"><span>Voice input</span><span class="value">' + esc(voiceSummary()) + ' ' + (voiceOpen ? '&#9652;' : '&#9662;') + '</span></button>';
     html += '</div>';
     if (foldersOpen) html += foldersDetailsHtml();
-    if (skillsOpen) html += skillsDetailsHtml();
     if (voiceOpen) html += voiceDetailsHtml();
 
-    html += '<div class="settings-group"><span class="scope-tag local">Local</span> only models on this computer</div>';
+    html += '<div class="section-toggle sub" data-act="toggleAdvanced">' + (advancedOpen ? icon('chevronDown') : icon('chevronRight')) + '<span>Advanced</span></div>';
+    if (!advancedOpen) return html;
     html += '<div class="settings-box">';
-    html += scopeRow('Context length', g.contextLabel || '', 'contextLength');
     html += scopeRow('Thinking', g.thinkingLabel || '', 'thinking');
-    html += scopeRow('Code completion', state.autocomplete || 'Off', 'autocomplete');
+    html += scopeRow('Context length', g.contextLabel || '', 'contextLength');
+    html += scopeRow('Reviewer model', g.reviewerLabel || '', 'reviewerModel');
     html += scopeRow('Meaning search', state.embeddingModel || 'Auto', 'embeddingModel');
-    html += '</div>';
-
-    html += '<div class="settings-group"><span class="scope-tag cloud">Cloud</span> only online models</div>';
-    html += '<div class="settings-box">';
+    html += scopeRow('Image generation', state.imageBackend || 'Off', 'imageBackend');
+    html += scopeRow('MCP servers', 'Manage...', 'manageMcp');
+    html += '<button class="setting" data-act="toggleSkillsOpen"><span>Claude skills</span><span class="value">' + esc(skillsSummary()) + ' ' + (skillsOpen ? '&#9652;' : '&#9662;') + '</span></button>';
     html += scopeRow('Switch model when a limit is hit', state.cloudAutoFallback ? 'On' : 'Off', 'cloudFallback');
+    html += scopeRow('Usage statistics', 'Show...', 'usageStats');
     html += '</div>';
+    if (skillsOpen) html += skillsDetailsHtml();
     return html;
   }
 
@@ -619,6 +642,7 @@
     bind('[data-act="chat"]', () => send('openChat'));
     bind('[data-act="mainTab"]', (el) => { mainTab = el.getAttribute('data-tab'); render(); });
     bind('[data-act="toggleSettings"]', () => { settingsOpen = !settingsOpen; render(); });
+    bind('[data-act="toggleAdvanced"]', () => { advancedOpen = !advancedOpen; render(); });
     bind('[data-act="systemPrompt"]', () => send('editSystemPrompt'));
     bind('[data-act="tab"]', (el) => { activeTab = el.getAttribute('data-tab'); render(); });
     bind('[data-act="install"]', (el) => send('installModel', { modelName: el.getAttribute('data-model') }));

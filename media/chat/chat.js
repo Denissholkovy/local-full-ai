@@ -264,9 +264,12 @@
   function renderEmptyState() {
     messagesEl.innerHTML = '';
     const hasProject = !!info.workspaceName;
-    const suggestions = hasProject
-      ? ['Create a simple calculator in index.html', 'Explain the structure of this project', 'Find possible bugs in the main files']
-      : ['Explain how closures work in JavaScript', 'Write a function that debounces another function'];
+    // Ideas that fit the folder: something to build in an empty one, something to do with the code in a full one.
+    const suggestions = !hasProject
+      ? ['Explain how closures work in JavaScript', 'Write a function that debounces another function']
+      : info.projectEmpty
+        ? ['Make a to-do list: index.html, style.css, script.js', 'Make a simple landing page for a coffee shop', 'Make a calculator: index.html, style.css, script.js']
+        : ['Explain the structure of this project', 'Find possible bugs in the main files', 'Suggest one improvement and make it'];
 
     const intro = hasProject
       ? (!info.agentEnabled
@@ -378,12 +381,90 @@
     }
   }
 
+  // Steps that follow each other in one answer share a group with a one-line summary ("Created 3 files"),
+  // collapsed by default: the chat shows what happened, the details are one click away.
+  function lastRow() {
+    let el = messagesEl.lastElementChild;
+    while (el && (el === activityEl || el.classList.contains('activity'))) el = el.previousElementSibling;
+    return el;
+  }
+
+  function stepsGroup() {
+    const last = lastRow();
+    if (last && last.classList.contains('steps')) return last.querySelector('.steps-body');
+    const row = document.createElement('div');
+    row.className = 'row steps';
+    row.innerHTML = '<div class="message-col"><div class="steps-group">' +
+      '<div class="steps-head"><span class="steps-icon"><span class="spinner"></span></span><span class="steps-summary"></span><span class="steps-chev">' + icon('chevronRight') + '</span></div>' +
+      '<div class="steps-body"></div></div></div>';
+    row.querySelector('.steps-head').addEventListener('click', (e) => {
+      const link = e.target.closest('.file-link');
+      if (link) {
+        post({ type: 'openFile', path: link.getAttribute('data-path') });
+        return;
+      }
+      row.querySelector('.steps-group').classList.toggle('open');
+    });
+    const stick = isNearBottom();
+    messagesEl.appendChild(row);
+    if (stick) scrollToBottom();
+    return row.querySelector('.steps-body');
+  }
+
+  const STEP_KINDS = {
+    write_file: 'write', edit_file: 'edit', generate_image: 'write',
+    read_file: 'look', list_files: 'look', search_text: 'look', semantic_search: 'look', get_problems: 'look', web_fetch: 'look',
+    run_command: 'run', delegate_task: 'agent'
+  };
+
+  function fileLinks(paths) {
+    const unique = [...new Set(paths)];
+    if (unique.length > 3) return unique.length + ' files';
+    return unique.map((p) => '<span class="file-link" data-path="' + escapeHtml(p) + '">' + escapeHtml(p.split('/').pop()) + '</span>').join(', ');
+  }
+
+  function updateStepsSummary(body) {
+    const group = body.closest('.steps-group');
+    const cards = [...body.querySelectorAll('.tool-card')];
+    const running = cards.find((c) => c.querySelector('.tool-status.pending'));
+    const icon_ = group.querySelector('.steps-icon');
+    const summary = group.querySelector('.steps-summary');
+    if (running) {
+      icon_.innerHTML = '<span class="spinner"></span>';
+      summary.innerHTML = running.querySelector('.tool-label').innerHTML;
+      return;
+    }
+    const by = { created: [], edited: [], look: 0, run: 0, agent: 0, other: 0, failed: 0 };
+    cards.forEach((c) => {
+      const ok = c.querySelector('.tool-status.ok');
+      if (!ok) {
+        if (!c.querySelector('.tool-status.denied')) by.failed++;
+        return;
+      }
+      const kind = STEP_KINDS[c.dataset.tool] || 'other';
+      if (kind === 'write' || kind === 'edit') (c.dataset.created === '1' ? by.created : by.edited).push(c.dataset.path || '');
+      else by[kind] = (by[kind] || 0) + 1;
+    });
+    const parts = [];
+    if (by.created.length) parts.push('<span>Created</span> ' + fileLinks(by.created));
+    if (by.edited.length) parts.push('<span>Edited</span> ' + fileLinks(by.edited));
+    if (by.look) parts.push('<span>Looked through the project</span>');
+    if (by.run) parts.push('<span>' + (by.run === 1 ? 'Ran a command' : 'Ran ' + by.run + ' commands') + '</span>');
+    if (by.agent) parts.push('<span>' + (by.agent === 1 ? 'Used a helper' : 'Used ' + by.agent + ' helpers') + '</span>');
+    if (!parts.length && by.other) parts.push('<span>' + (by.other === 1 ? 'Done 1 step' : 'Done ' + by.other + ' steps') + '</span>');
+    const changed = by.created.length + by.edited.length > 0;
+    icon_.innerHTML = changed || !by.failed ? icon('check') : icon('warning');
+    icon_.className = 'steps-icon ' + (changed || !by.failed ? 'ok' : 'err');
+    summary.innerHTML = parts.join(' &middot; ') + (by.failed ? ' <span class="steps-retries">' + (by.failed === 1 ? '1 retry' : by.failed + ' retries') + '</span>' : '');
+    group.title = cards.length === 1 ? '' : 'Click to see the ' + cards.length + ' steps';
+  }
+
   function addToolCard(id, name, label, filePath) {
     removeEmptyState();
+    const body = stepsGroup();
     const row = document.createElement('div');
-    row.className = 'row tool';
-    const col = document.createElement('div');
-    col.className = 'message-col';
+    row.className = 'step';
+    const col = row;
     const card = document.createElement('div');
     card.className = 'tool-card';
     card.dataset.tool = name;
@@ -413,11 +494,12 @@
     });
 
     col.appendChild(card);
-    row.appendChild(col);
-    const wasNearBottom = isNearBottom();
-    messagesEl.appendChild(row);
-    if (wasNearBottom) scrollToBottom();
+    body.appendChild(row);
     toolCards[id] = card;
+    if (/^Creating /.test(label)) card.dataset.created = '1';
+    // Kept apart from the text: the visible label may already be translated when the step finishes.
+    card.dataset.verb = (String(label).match(/^(\w+) /) || [])[1] || '';
+    updateStepsSummary(body);
     return card;
   }
 
@@ -430,18 +512,16 @@
     const labelEl = card.querySelector('.tool-label');
     if (ok && labelEl) {
       const node = labelEl.firstChild;
-      if (node && node.nodeType === 3) {
-        for (const pair of PAST_TENSE) {
-          if (node.nodeValue.indexOf(pair[0]) === 0) {
-            node.nodeValue = pair[1] + node.nodeValue.slice(pair[0].length);
-            break;
-          }
-        }
+      const pair = PAST_TENSE.find((p) => p[0] === card.dataset.verb + ' ');
+      if (node && node.nodeType === 3 && pair) {
+        const rest = node.nodeValue.replace(/^\S+\s/, '');
+        node.nodeValue = pair[1] + rest;
       }
     }
     const status = card.querySelector('.tool-status');
-    status.className = 'tool-status ' + (ok ? 'ok' : 'err');
+    status.className = 'tool-status ' + (denied ? 'denied' : ok ? 'ok' : 'err');
     status.innerHTML = denied ? icon('shield') + ' Denied' : ok ? icon('check') : icon('warning');
+    if (diff && diff.isNew) card.dataset.created = '1';
     const out = card.querySelector('.tool-output');
     out.textContent = output || '';
     if (diff && diff.lines) {
@@ -472,10 +552,6 @@
         actions.appendChild(more);
       }
       if (diffMeta && diffMeta.path) {
-        const open = document.createElement('button');
-        open.textContent = 'Open file';
-        open.onclick = () => post({ type: 'openFile', path: diffMeta.path });
-        actions.appendChild(open);
         if (diffMeta.hasBefore) {
           const cmp = document.createElement('button');
           cmp.textContent = 'Open diff';
@@ -483,19 +559,12 @@
           actions.appendChild(cmp);
         }
       }
-      card.appendChild(actions);
-    } else if (ok && card.dataset.path && (card.dataset.tool === 'write_file' || card.dataset.tool === 'edit_file')) {
-      const actions = document.createElement('div');
-      actions.className = 'tool-actions';
-      const open = document.createElement('button');
-      open.textContent = 'Open file';
-      open.onclick = () => post({ type: 'openFile', path: card.dataset.path });
-      actions.appendChild(open);
-      card.appendChild(actions);
-      card.classList.add('open');
+      if (actions.children.length) card.appendChild(actions);
     }
     if (card.dataset.tool === 'update_plan' && output) card.classList.add('open');
     if (!output) card.querySelector('.tool-head').style.cursor = 'default';
+    const body = card.closest('.steps-body');
+    if (body) updateStepsSummary(body);
   }
 
   function buildDiff(preview) {
@@ -560,7 +629,7 @@
     const isMcp = /^mcp:/.test(d.permission || '');
     return [
       { label: 'Yes', decision: 'allow' },
-      { label: d.permission === 'web' ? "Yes, and don't ask again for web pages in this chat" : isMcp ? "Yes, and don't ask again for this server in this chat" : isCommand ? "Yes, and don't ask again for commands in this chat" : "Yes, and don't ask again for edits in this chat", decision: 'always' },
+      { label: 'Always in this chat', decision: 'always', title: d.permission === 'web' ? "Yes, and don't ask again for web pages in this chat" : isMcp ? "Yes, and don't ask again for this server in this chat" : isCommand ? "Yes, and don't ask again for commands in this chat" : "Yes, and don't ask again for edits in this chat" },
       { label: 'No', decision: 'deny' }
     ];
   }
@@ -631,12 +700,13 @@
     }
 
     const list = document.createElement('div');
-    list.className = 'dialog-options';
+    list.className = 'dialog-options' + (isQuestion ? '' : ' inline');
     options.forEach((opt, i) => {
       const btn = document.createElement('button');
-      btn.className = 'dialog-option' + (i === dialogSelected ? ' selected' : '');
+      btn.className = 'dialog-option' + (i === dialogSelected ? ' selected' : '') + (opt.decision === 'deny' ? ' deny' : '');
       btn.innerHTML = '<span class="dialog-num">' + (i + 1) + '</span><span class="dialog-label"></span>';
       btn.querySelector('.dialog-label').textContent = opt.label;
+      if (opt.title) btn.title = opt.title;
       btn.addEventListener('click', () => answerDialog(opt));
       btn.addEventListener('mouseenter', () => {
         dialogSelected = i;
@@ -659,11 +729,25 @@
         else if (options[dialogSelected]) answerDialog(options[dialogSelected]);
       }
     });
-    box.appendChild(field);
-
     const hint = document.createElement('div');
     hint.className = 'dialog-hint';
-    hint.textContent = (options.length ? '1-' + options.length + ' or Enter to choose' : 'Type an answer and press Enter') + '  \u00b7  Esc to cancel';
+    hint.textContent = (options.length ? '1-' + options.length + ' or Enter' : 'Type an answer and press Enter') + '  \u00b7  Esc';
+    if (isQuestion) {
+      box.appendChild(field);
+    } else {
+      // Telling the AI what to do instead is rare: it stays one click away.
+      field.style.display = 'none';
+      const other = document.createElement('button');
+      other.className = 'dialog-other';
+      other.textContent = 'Something else...';
+      other.onclick = () => {
+        other.style.display = 'none';
+        field.style.display = '';
+        field.focus();
+      };
+      hint.prepend(other);
+      box.appendChild(field);
+    }
     box.appendChild(hint);
 
     dialogDock.appendChild(box);
@@ -773,8 +857,91 @@
   const dockEl = document.getElementById('dialogDock');
   if (dockEl) new MutationObserver(syncActivity).observe(dockEl, { childList: true });
 
+  // What happened in the current answer, for the quiet line under it when it is done.
+  let runInfo = { files: [], check: null };
+
+  function plural(n, one, many) {
+    return n === 1 ? one : n + ' ' + many;
+  }
+
+  function renderRunFooter(seconds, live) {
+    messagesEl.querySelectorAll('.run-footer .run-actions').forEach((el) => el.remove());
+    const old = document.getElementById('changesBar');
+    if (old) old.remove();
+    const parts = [];
+    if (seconds >= 1) parts.push('<span>Done in</span> <span>' + (seconds < 60 ? seconds + ' s' : Math.round(seconds / 60) + ' min') + '</span>');
+    if (runInfo.files.length) {
+      const created = runInfo.files.filter((f) => f.isNew).length;
+      parts.push('<span>' + plural(runInfo.files.length, '1 file changed', 'files changed') + '</span>' + (created ? ' <span>(' + created + ' new)</span>' : ''));
+    }
+    if (runInfo.check === 'passed' || runInfo.check === 'reviewed') {
+      parts.push('<span class="run-ok">' + icon('check') + '<span>' + (runInfo.check === 'reviewed' ? 'Checked by the reviewer' : 'Checked') + '</span></span>');
+    } else if (runInfo.check === 'problems') {
+      parts.push('<span class="run-warn">' + icon('warning') + '<span>Problems left</span></span>');
+    }
+    if (!parts.length && !live) return;
+    const footer = document.createElement('div');
+    footer.className = 'run-footer';
+    footer.innerHTML = '<span class="run-meta">' + parts.join(' &middot; ') + '</span><span class="run-actions"></span>';
+    const actions = footer.querySelector('.run-actions');
+    if (runInfo.files.length) {
+      const undo = document.createElement('button');
+      undo.innerHTML = icon('refresh') + '<span>Undo changes</span>';
+      undo.title = runInfo.files.map((f) => f.rel).join('\n');
+      undo.onclick = () => post({ type: 'revertChanges' });
+      actions.appendChild(undo);
+    }
+    if (live) {
+      const retry = document.createElement('button');
+      retry.innerHTML = icon('play') + '<span>Retry</span>';
+      retry.title = 'Ask the model again';
+      retry.onclick = () => {
+        if (isGenerating) return;
+        while (messagesEl.lastElementChild && !messagesEl.lastElementChild.classList.contains('user')) messagesEl.lastElementChild.remove();
+        setGeneratingUI(true);
+        post({ type: 'regenerate' });
+      };
+      actions.appendChild(retry);
+    }
+    const stick = isNearBottom();
+    messagesEl.appendChild(footer);
+    if (stick) scrollToBottom();
+  }
+
+  function renderPlanCard(plan, finished) {
+    removeEmptyState();
+    const row = document.createElement('div');
+    row.className = 'row plan';
+    const items = (plan.files || []).map((f) =>
+      '<li class="plan-item' + (finished ? ' done' : '') + '" data-path="' + escapeHtml(f.path) + '"><span class="plan-mark"></span>' +
+      '<span class="file-link" data-path="' + escapeHtml(f.path) + '">' + escapeHtml(f.path) + '</span>' +
+      (f.purpose ? '<span class="plan-purpose">' + escapeHtml(f.purpose) + '</span>' : '') + '</li>').join('');
+    const checks = (plan.checks || []).map((c) => '<li>' + escapeHtml(c) + '</li>').join('');
+    row.innerHTML = '<div class="message-col"><div class="plan-card">' +
+      '<div class="plan-title">' + icon('list') + '<span>Plan</span></div>' +
+      '<ul class="plan-files">' + items + '</ul>' +
+      (checks ? '<div class="plan-sub">Must work</div><ul class="plan-checks">' + checks + '</ul>' : '') +
+      '</div></div>';
+    row.querySelectorAll('.file-link').forEach((link) => {
+      link.onclick = () => post({ type: 'openFile', path: link.getAttribute('data-path') });
+    });
+    const stick = isNearBottom();
+    messagesEl.appendChild(row);
+    if (stick) scrollToBottom();
+  }
+
+  function markPlanStep(filePath, state) {
+    const cards = messagesEl.querySelectorAll('.plan-card');
+    const card = cards[cards.length - 1];
+    if (!card) return;
+    card.querySelectorAll('.plan-item').forEach((li) => {
+      if (li.getAttribute('data-path') === filePath) li.className = 'plan-item ' + state;
+    });
+  }
+
   function setGeneratingUI(active) {
     if (active && !isGenerating) {
+      runInfo = { files: [], check: null };
       activitySince = Date.now();
       activityLabel = 'Thinking';
       if (!activityTimer) activityTimer = setInterval(() => { if (activityEl) activityEl.querySelector('.activity-text').textContent = activityText(); }, 1000);
@@ -842,7 +1009,7 @@
   function updateUsage() {
     const count = usage.agents.length;
     const total = usageTotals().total;
-    if (count === 0 && total === 0) {
+    if (count === 0) {
       usageBtn.style.display = 'none';
       return;
     }
@@ -959,10 +1126,10 @@
   });
 
   const MODES = [
-    { id: 'ask', label: 'Ask before edits', desc: 'Every edit and command needs your approval' },
-    { id: 'auto', label: 'Edit automatically', desc: 'Edits are applied right away, commands still ask' },
-    { id: 'readonly', label: 'Read only', desc: 'The AI can look at files but changes nothing' },
-    { id: 'autopilot', label: 'Autopilot', desc: 'Works on its own until the task is done. Edits and safe commands run without asking' }
+    { id: 'ask', icon: 'shield', short: 'Asks', label: 'Ask before edits', desc: 'Every edit and command needs your approval' },
+    { id: 'auto', icon: 'pencil', short: 'Edits', label: 'Edit automatically', desc: 'Edits are applied right away, commands still ask' },
+    { id: 'readonly', icon: 'eye', short: 'Reads', label: 'Read only', desc: 'The AI can look at files but changes nothing' },
+    { id: 'autopilot', icon: 'bolt', short: 'Autopilot', label: 'Autopilot', desc: 'Works on its own until the task is done. Edits and safe commands run without asking' }
   ];
 
   const popMenu = document.createElement('div');
@@ -1100,9 +1267,11 @@
       const isCloud = !!info.cloudProvider;
       const shown = info.modelName.startsWith('cloud:') ? info.modelName.split(':').slice(2).join(':') : info.modelName;
       const modeNames = { direct: 'fast', standard: 'standard', agent: 'agent' };
-      modelChip.innerHTML = icon('box') + '<span>' + escapeHtml(shown) + '</span>' +
+      modelChip.innerHTML = '<span class="model-dot' + (isCloud ? ' cloud' : '') + '"></span>' +
+        '<span class="model-name">' + escapeHtml(shown) + '</span>' +
         (isCloud ? '<span class="cloud-pill">cloud</span>' : '') +
-        (info.workMode ? '<span class="mode-pill mode-' + info.workMode + '" title="How the AI works with this model (Settings > Work mode)">' + modeNames[info.workMode] + '</span>' : '');
+        (info.workMode ? '<span class="mode-pill mode-' + info.workMode + '" title="How the AI works with this model (Settings > Work mode)">' + modeNames[info.workMode] + '</span>' : '') +
+        '<span class="chev">' + icon('chevronDown') + '</span>';
       modelChip.className = 'pill' + (isCloud ? ' is-cloud' : '');
       modelChip.title = isCloud
         ? shown + ' - cloud model: your messages and the files it reads are sent to ' + info.cloudProvider + '. Click to change the model.'
@@ -1144,7 +1313,9 @@
     }
 
     const mode = MODES.find((m) => m.id === info.permissionMode) || MODES[0];
-    modeBtn.innerHTML = icon('code') + '<span>' + mode.label + '</span>';
+    modeBtn.innerHTML = icon(mode.icon) + '<span class="mode-label">' + mode.short + '</span>';
+    modeBtn.className = 'tool-btn mode-' + mode.id;
+    modeBtn.title = mode.label + ': ' + mode.desc + '. Click to change.';
     modeBtn.style.display = info.workspaceName ? 'inline-flex' : 'none';
 
     if (!messagesEl.children.length || messagesEl.querySelector('.empty-state')) renderEmptyState();
@@ -1287,7 +1458,9 @@
           addRow(renderMarkdown(m.content || ''), 'user', m.content || '');
         }
       } else if (m.role === 'assistant') {
-        if (m.content && splitThinking(m.content).visible) {
+        if (m.planData) {
+          renderPlanCard(m.planData, true);
+        } else if (m.content && splitThinking(m.content).visible) {
           addRow(renderMarkdown(m.content), 'assistant', m.content);
         }
         (m.tool_calls || []).forEach((call, i) => {
@@ -1300,8 +1473,8 @@
           queue.push(card);
         });
       } else if (m.role === 'step') {
-        const label = (m.diff && m.diff.isNew ? 'Creating ' : 'Updating ') + m.path;
-        const card = addToolCard('s' + messagesEl.children.length, 'write_file', label, m.path);
+        const label = (m.diff && m.diff.isNew ? 'Creating ' : m.name === 'edit_file' ? 'Editing ' : 'Updating ') + m.path;
+        const card = addToolCard('s' + messagesEl.children.length, m.name || 'write_file', label, m.path);
         finishToolCard(card, m.ok, m.denied, m.output || '', m.diff, m.diff ? { path: m.path, hasBefore: false } : null);
       } else if (m.role === 'notice') {
         addRow(escapeHtml(m.content || ''), 'notice');
@@ -1516,10 +1689,24 @@
         setActivity('Thinking');
         syncActivity();
         break;
-      case 'replyDone':
+      case 'replyDone': {
         currentBubble = null;
+        const seconds = Math.round((Date.now() - activitySince) / 1000);
         setGeneratingUI(false);
-        addRegenerateButton();
+        renderRunFooter(seconds, true);
+        break;
+      }
+      case 'status':
+        if (isGenerating && msg.text) setActivity(msg.text);
+        break;
+      case 'checkResult':
+        runInfo.check = msg.result;
+        break;
+      case 'plan':
+        renderPlanCard(msg.plan || {}, false);
+        break;
+      case 'planStep':
+        markPlanStep(msg.path, msg.state);
         break;
       case 'toolStart':
         setActivity('Working on your project');
@@ -1581,19 +1768,8 @@
         break;
       }
       case 'changesSummary': {
-        const old = document.getElementById('changesBar');
-        if (old) old.remove();
-        if (!msg.files || !msg.files.length) break;
-        const bar = document.createElement('div');
-        bar.id = 'changesBar';
-        bar.className = 'changes-bar';
-        const created = msg.files.filter((f) => f.isNew).length;
-        bar.innerHTML = '<span>' + msg.files.length + ' file' + (msg.files.length > 1 ? 's' : '') + ' changed' + (created ? ' (' + created + ' new)' : '') + '</span>' +
-          '<button class="suggestion" id="undoChanges">Undo all changes</button>';
-        bar.title = msg.files.map((f) => f.rel).join('\n');
-        messagesEl.appendChild(bar);
-        bar.querySelector('#undoChanges').onclick = () => post({ type: 'revertChanges' });
-        scrollToBottom();
+        runInfo.files = msg.files || [];
+        if (!isGenerating && runInfo.files.length && !messagesEl.querySelector('.run-footer .run-actions button')) renderRunFooter(0, false);
         break;
       }
       case 'serverStartResult':

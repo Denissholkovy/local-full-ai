@@ -434,7 +434,7 @@ class CloudClient {
       handle(buffer.trim());
     } catch (err) {
       if (looped && !aborted) {
-        if (onNotice) onNotice('The model started repeating itself, so the answer was cut. This model is too weak for this task: pick a stronger one.');
+        if (onNotice) onNotice('The model started repeating itself, so the answer was cut. This model is too weak for this task: pick a stronger one.', true);
         return { content, toolCalls: [] };
       }
       if (aborted) return { content, toolCalls: [] };

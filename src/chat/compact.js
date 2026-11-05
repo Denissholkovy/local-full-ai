@@ -48,7 +48,7 @@ module.exports = {
     if (userTurns.length <= MIN_TURNS_TO_COMPACT) return;
     const cut = userTurns[userTurns.length - MIN_TURNS_TO_COMPACT];
 
-    ctx.post({ type: 'contextTrimmed', text: 'The chat is getting long: summarising the earlier messages so the model keeps the important parts...' });
+    ctx.post({ type: 'status', text: 'The chat is getting long: summarising the earlier messages so the model keeps the important parts...' });
     const transcript = asTranscript(session.history.slice(start, cut), Math.max(2000, Math.floor(budgetChars * 0.5)));
     const messages = [
       {
@@ -77,7 +77,7 @@ module.exports = {
       ctx.persist();
     } catch (_) {
       if (!cloud.isCloudModel(ctx.modelName)) return;
-      ctx.post({ type: 'contextTrimmed', text: 'Could not summarise the earlier messages; the oldest ones are left out instead.' });
+      ctx.post({ type: 'status', text: 'Could not summarise the earlier messages; the oldest ones are left out instead.' });
     }
   }
 };
