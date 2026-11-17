@@ -2,6 +2,22 @@
 
 All notable changes to the "Local Full AI" extension are documented here.
 
+## [Unreleased]
+
+### Added
+- Short requests such as "fix it here", "rename this" or "fix the error" now work. With each request the AI sees what you
+  have open: the file, the lines around the cursor or the selected code, the errors VS Code shows in that file, and the
+  other open tabs.
+- Code names in a request (`addTask`, `render_list()`, `#display`) are looked up in the project before the AI starts, and
+  with an embedding model installed, the code closest in meaning to the request is shown to it too. Small models no longer
+  have to search for it themselves.
+- New Markdown documents the AI writes go into `docs/`, and plans and briefs into `docs/briefs/`, instead of the project
+  root. README, CHANGELOG and files you name yourself stay where you say.
+
+### Fixed
+- While you typed in the chat, VS Code reported no open editor, so the AI did not see the file you were working on and
+  "Insert at cursor" did nothing. The last file you had open is now used.
+
 ## [0.2.0] - 2026-11-05
 
 ### Fixed

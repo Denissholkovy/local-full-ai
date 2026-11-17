@@ -7,6 +7,7 @@ const ollamaProcess = require('./ollamaProcess');
 const voice = require('./voice');
 const beforeContent = require('./beforeContent');
 const diagnostics = require('./diagnostics');
+const editorContext = require('./context/editor');
 
 let activeClient = null;
 
@@ -14,6 +15,7 @@ function activate(context) {
   const config = vscode.workspace.getConfiguration('localAI');
   const ollamaClient = new OllamaClient(config.get('ollamaBaseUrl'));
   activeClient = ollamaClient;
+  context.subscriptions.push(...editorContext.track(vscode));
 
   context.subscriptions.push(
     vscode.commands.registerCommand('localAI.selectModel', () => {

@@ -14,6 +14,7 @@ vscodeStub.window.activeTextEditor = undefined;
 vscodeStub.window.showInformationMessage = () => {};
 vscodeStub.window.showWarningMessage = async () => undefined;
 vscodeStub.workspace.isTrusted = true;
+vscodeStub.workspace.getWorkspaceFolder = () => undefined;
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(`--${name}`);
@@ -51,6 +52,31 @@ function lostLines(seed, dir) {
   return { lost, total, ratio: total ? lost / total : 0, perFile };
 }
 
+function lineOf(text, needle) {
+  const i = needle ? text.indexOf(needle) : -1;
+  return i < 0 ? 0 : text.slice(0, i).split('\n').length - 1;
+}
+
+// What the user has open: the file, the cursor line (`at`) or a selection (`select`).
+function fakeEditor(root, { file, at, select }) {
+  const fsPath = path.join(root, file);
+  const text = fs.readFileSync(fsPath, 'utf8');
+  const line = lineOf(text, select || at);
+  const chosen = select && text.includes(select) ? select : null;
+  return {
+    document: { uri: { scheme: 'file', fsPath }, isClosed: false, isDirty: false, getText: (range) => (range ? chosen : text) },
+    selection: { isEmpty: !chosen, active: { line }, start: { line }, end: { line: chosen ? line + chosen.split('\n').length - 1 : line } }
+  };
+}
+
+function fakeProblems(root, list) {
+  return () => (list || []).map((p) => {
+    const fsPath = path.join(root, p.file);
+    const line = lineOf(fs.readFileSync(fsPath, 'utf8'), p.at);
+    return [{ scheme: 'file', fsPath }, [{ severity: 0, message: p.message, source: 'eval', range: { start: { line, character: 0 } } }]];
+  });
+}
+
 function makeContext(storage) {
   const state = new Map();
   return {
@@ -69,6 +95,8 @@ async function runTask(task, modelName, client, timeoutSec, outDir) {
   const context = makeContext(storage);
   context.globalState.update('localAI.permissionMode', 'auto');
   const tools = new WorkspaceTools(root);
+  vscodeStub.window.activeTextEditor = task.editor ? fakeEditor(root, task.editor) : undefined;
+  vscodeStub.languages = { getDiagnostics: fakeProblems(root, task.problems) };
   const posted = [];
   const panel = Object.create(ChatPanel.prototype);
   Object.assign(panel, {
@@ -95,7 +123,7 @@ async function runTask(task, modelName, client, timeoutSec, outDir) {
     _postFor: (s, m) => posted.push(m)
   });
   const session = { id: `eval-${task.id}`, title: task.id, history: [], updatedAt: Date.now() };
-  if (task.kind === 'edit' || task.kind === 'question') session.writtenFiles = Object.keys(task.seed);
+  if ((task.kind === 'edit' || task.kind === 'question') && !task.fresh) session.writtenFiles = Object.keys(task.seed);
   panel._sessions = [session];
   panel._currentSessionId = session.id;
   session.history.push({ role: 'user', content: task.prompt, display: { text: task.prompt } });

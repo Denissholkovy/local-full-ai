@@ -201,6 +201,7 @@ function buildAgentPrompt(rootName) {
     '- NEVER paste code or file contents into the chat. Create or change files in the project with write_file or edit_file, then reply with one or two short sentences. The chat is only for talking, questions and corrections.',
     '- When the user asks for a fix or a change, work on the existing files: read them first, then edit them. Do not start over.',
     '- Keep the layout simple: put a new standalone page or script in the project root (for example index.html, style.css, script.js) unless the project already has a clear structure. Use the file type the user asked for (an html request means .html, not a framework component).',
+    '- New Markdown documents you write (notes, guides, plans, briefs) go into docs/ (plans and briefs into docs/briefs/), not the project root. README.md and CHANGELOG.md stay in the root.',
     '- Edits and commands need the user\'s approval. If an action is denied, do not retry it; ask what to do instead.',
     '- When the task is done, summarise what you did in one to three short sentences: what changed and how to use it.',
     '- For a question, give the answer in the first sentence, then only the details that help. No introductions.',
@@ -254,7 +255,7 @@ function buildFilesPrompt(rootName, kind = 'new') {
     'Rules:',
     '- Every piece of code goes into a <file> block and the app saves it into the project. The chat is only for talking.',
     '- Give the COMPLETE content of every file, with each section written only once.',
-    '- Create the files the feature needs (for example index.html, style.css, script.js) with short relative paths. New standalone pages go in the project root. Use the file type the user asked for.',
+    '- Create the files the feature needs (for example index.html, style.css, script.js) with short relative paths. New standalone pages go in the project root. Use the file type the user asked for. New Markdown documents go into docs/ (plans and briefs into docs/briefs/).',
     '- A new feature must work: write all its HTML, CSS and JavaScript, not only the buttons. Every button and field needs its code.',
     ...common
   ].join('\n');

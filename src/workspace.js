@@ -2,6 +2,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const vscode = require('vscode');
+const editorContext = require('./context/editor');
 
 const LEVELS = ['none', 'read', 'ask', 'full'];
 
@@ -44,7 +45,7 @@ function workspaceFolderPaths() {
 }
 
 function resolveWorkspaceRoot() {
-  const editor = vscode.window.activeTextEditor;
+  const editor = editorContext.currentEditor(vscode);
   const folder = editor ? vscode.workspace.getWorkspaceFolder(editor.document.uri) : undefined;
   const real = (vscode.workspace.workspaceFolders || []).filter((f) => f.uri.scheme === 'file');
   const target = (folder && folder.uri.scheme === 'file' ? folder : null) || real[0];

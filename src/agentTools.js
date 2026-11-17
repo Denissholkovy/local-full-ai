@@ -326,7 +326,13 @@ function looksLikeFollowUpEdit(text, hasFiles) {
   if (!hasFiles) return false;
   const t = String(text || '').trim();
   if (!t || t.length > 240 || /\?\s*$/.test(t)) return false;
-  return !/^(дякую|дяка|спасибо|thanks|thank you|ok|окей|добре|супер|круто|привіт|hi|hello|чудово|клас|ага)[\s.!]*$/i.test(t);
+  return !isSmallTalk(t);
+}
+
+const SMALL_TALK = /^(дякую|дяка|спасибо|thanks|thank you|ok|окей|добре|супер|круто|привіт|привет|hi|hello|hey|чудово|клас|ага|ясно|зрозумів|понял|got it|cool|nice)[\s.!)]*$/i;
+
+function isSmallTalk(text) {
+  return SMALL_TALK.test(String(text || '').trim());
 }
 
 function detectLanguage(text) {
@@ -397,6 +403,7 @@ function looksLikeToolAttempt(content) {
 }
 
 module.exports = {
+  isSmallTalk,
   requestKind,
   repeatsText,
   briefProblem,

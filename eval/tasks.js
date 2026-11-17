@@ -333,6 +333,68 @@ const TASKS = [
     allowed: [],
     prompt: 'Що робить script.js? Коротко.',
     check: async (dir, run) => [{ name: 'gives an answer', ok: /задач|task|спис|list/i.test(run.answer || '') }]
+  },
+
+  // Short requests that only make sense with what the user has open: no files are pre-loaded as "written in this chat".
+  {
+    id: 'short-here-bug',
+    kind: 'edit',
+    fresh: true,
+    seed: calcProject('a + b'),
+    allowed: ['script.js'],
+    editor: { file: 'script.js', at: "if (op === '-')" },
+    prompt: 'тут баг, виправ',
+    check: (dir) => calcWorks(dir, [[['9', '-', '4', '='], '5'], [['7', '+', '8', '='], '15'], [['6', '*', '7', '='], '42']])
+  },
+  {
+    id: 'short-selection-rename',
+    kind: 'edit',
+    fresh: true,
+    seed: todoProject(),
+    allowed: ['script.js'],
+    editor: { file: 'script.js', select: 'function addTask()' },
+    prompt: 'перейменуй на createTask',
+    check: async (dir) => {
+      const js = read(dir, 'script.js') || '';
+      return [
+        { name: 'no addTask left', ok: !/\baddTask\b/.test(js) },
+        { name: 'createTask is defined', ok: /function\s+createTask\b|createTask\s*=/.test(js) },
+        ...(await todoWorks(dir))
+      ];
+    }
+  },
+  {
+    id: 'short-fix-error',
+    kind: 'edit',
+    fresh: true,
+    seed: { ...calcProject(), 'script.js': calcScript('a - b').replace('display.value =', 'dispaly.value =') },
+    allowed: ['script.js'],
+    editor: { file: 'script.js', at: 'const display' },
+    problems: [{ file: 'script.js', at: 'dispaly.value', message: "Cannot find name 'dispaly'. Did you mean 'display'?" }],
+    prompt: 'виправ помилку',
+    check: (dir) => calcWorks(dir, [[['7', '+', '8', '='], '15'], [['9', '-', '4', '='], '5']])
+  },
+  {
+    id: 'short-by-name',
+    kind: 'edit',
+    fresh: true,
+    seed: todoProject(),
+    allowed: ['script.js'],
+    prompt: 'addTask хай не очищає поле після додавання',
+    check: async (dir) => {
+      const page = await openPage(dir);
+      if (page.error) return [{ name: page.error, ok: false }];
+      const { document, window } = page;
+      const input = document.getElementById('new-task');
+      const add = document.getElementById('add-task');
+      let kept = false;
+      if (input && add) {
+        input.value = 'Купити хліб';
+        add.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+        kept = input.value === 'Купити хліб';
+      }
+      return [{ name: 'the field keeps its text after adding', ok: kept }, ...(await todoWorks(dir))];
+    }
   }
 ];
 

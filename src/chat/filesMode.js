@@ -1,4 +1,4 @@
-const { vscode, fs, path, truncate, agentTools, agentFiles, CONTEXT_FILE_CHARS, CONTEXT_TOTAL_CHARS, languageNote, capDiff, buildFilesPrompt } = require('./common');
+const { path, truncate, agentFiles, languageNote, capDiff, buildFilesPrompt } = require('./common');
 
 // Methods mixed into ChatPanel.prototype (see chatPanel.js).
 module.exports = {
@@ -70,6 +70,7 @@ module.exports = {
       buildFilesPrompt(path.basename(tools.root), run.kind),
       `Folders you may use:\n${tools.accessSummary()}\n\nProject structure:\n${tools.overview()}`,
       this._filesContext(ctx),
+      ...(run.contextNotes || []),
       ctx.autoSkillsText,
       languageNote(run.lang)
     ].filter(Boolean).join('\n\n');
@@ -96,73 +97,5 @@ module.exports = {
     session.writtenFiles = (session.writtenFiles || []).filter((f) => f !== relPath);
     session.writtenFiles.push(relPath);
     if (session.writtenFiles.length > 12) session.writtenFiles.shift();
-  },
-
-  _filesContext(ctx) {
-    const { tools, session } = ctx;
-    if (!tools) return '';
-    const perFile = ctx.compact ? 2200 : CONTEXT_FILE_CHARS;
-    const total = ctx.compact ? 5000 : CONTEXT_TOTAL_CHARS;
-    const picks = [];
-    const add = (rel) => {
-      if (rel && !picks.includes(rel)) picks.push(rel);
-    };
-    (session.writtenFiles || []).slice(-5).reverse().forEach(add);
-    tools.findFilesByName(ctx.userText || '', 3).forEach(add);
-    const editor = vscode.window.activeTextEditor;
-    if (editor && editor.document.uri.scheme === 'file') {
-      try {
-        add(tools.relative(tools.resolve(editor.document.uri.fsPath)));
-      } catch (_) {
-      }
-    }
-
-    // A page is only half of the feature: its scripts and styles belong with it.
-    picks.slice().forEach((rel) => {
-      if (!/\.html?$/i.test(rel)) return;
-      let html = '';
-      try {
-        html = fs.readFileSync(tools.resolve(rel), 'utf8');
-      } catch (_) {
-        return;
-      }
-      const re = /<script[^>]*\bsrc\s*=\s*["']([^"']+)["']|<link[^>]*\bhref\s*=\s*["']([^"']+\.css)["']/gi;
-      let m;
-      while ((m = re.exec(html)) !== null) {
-        const ref = (m[1] || m[2]).split(/[?#]/)[0];
-        if (/^(https?:)?\/\/|^data:/i.test(ref)) continue;
-        try {
-          const abs = path.resolve(path.dirname(tools.resolve(rel)), ref);
-          if (fs.existsSync(abs)) add(tools.relative(abs));
-        } catch (_) {
-        }
-      }
-    });
-
-    let snapshot = false;
-    if (picks.length === 0 && !ctx.isSub && (agentTools.looksLikeTask(ctx.userText) || agentTools.looksLikeFollowUpEdit(ctx.userText, true))) {
-      tools.listSourceFiles(ctx.compact ? 3 : 5).forEach(add);
-      snapshot = picks.length > 0;
-    }
-
-    let budget = total;
-    const blocks = [];
-    for (const rel of picks) {
-      if (budget <= 0) break;
-      let data = null;
-      try {
-        data = tools.readForContext(rel, Math.min(perFile, budget));
-      } catch (_) {
-        data = null;
-      }
-      if (!data) continue;
-      budget -= data.text.length;
-      blocks.push(`### ${rel}${data.truncated ? ' (shortened, the file is longer)' : ''}\n\`\`\`\n${data.text}\n\`\`\``);
-    }
-    if (!blocks.length) return '';
-    const heading = snapshot
-      ? 'The project files (shown so you do not need to search for them; read others with read_file):'
-      : 'Current contents of the files you are working on (the user may have changed them by hand since you wrote them, so continue from THIS version):';
-    return `${heading}\n\n${blocks.join('\n\n')}`;
-  },
+  }
 };

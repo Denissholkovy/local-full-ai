@@ -8,6 +8,8 @@ const webFetch = require('./webFetch');
 const usageStats = require('./usageStats');
 const { stripLeakedThinking } = require('./ollamaClient');
 const { rewriteProblem } = require('./tools');
+const docsLocation = require('./context/docsLocation');
+const editorContext = require('./context/editor');
 
 // A change that could not be saved goes back to the model this many times.
 const MAX_SAVE_RETRIES = 2;
@@ -110,7 +112,7 @@ class ChatPanel {
         await vscode.env.clipboard.writeText(msg.text);
         break;
       case 'insertAtCursor': {
-        const editor = vscode.window.activeTextEditor;
+        const editor = editorContext.currentEditor(vscode);
         if (editor) {
           editor.edit((editBuilder) => {
             editBuilder.insert(editor.selection.active, msg.text);
@@ -747,6 +749,7 @@ class ChatPanel {
       late.push(`${oneFolder ? '' : `Folders you may use:\n${tools.accessSummary()}\n\n`}Project structure:\n${tools.overview(40, 2)}`);
       const current = this._filesContext(ctx);
       if (current) late.push(current);
+      late.push(...(ctx.run.contextNotes || []));
     } else {
       parts.push(ctx.compact && tools ? buildCompactAgentPrompt(path.basename(tools.root)) : buildAgentPrompt(tools ? path.basename(tools.root) : null));
       if (tools) late.push(ctx.compact
@@ -766,6 +769,7 @@ class ChatPanel {
         }
         const current = this._filesContext(ctx);
         if (current) late.push(current);
+        late.push(...(ctx.run.contextNotes || []));
       }
       if (tools && ctx.toolsEnabled && !ctx.compact && ctx.mode !== 'readonly') {
         parts.push('Project memory: when you learn something lasting about this project (how to run or test it, a convention, where something lives, a mistake to avoid), call remember with one short sentence. Do not store task details.');
@@ -967,6 +971,7 @@ class ChatPanel {
     };
 
     try {
+      await this._gatherContext(ctx);
       await this._maybeCompact(ctx);
       const built = this._stepwiseWanted(ctx) && (await this._buildInSteps(ctx));
       if (!built) await this._agentLoop(ctx);
@@ -1349,6 +1354,9 @@ class ChatPanel {
     const name = (call.function && call.function.name) || 'unknown';
     const args = normalizeArgs(call.function && call.function.arguments);
     const id = `t${++this._toolCounter}`;
+    const movedDoc = name === 'write_file' && tools ? docsLocation.place(args.path, { root: tools.root, task: run.task }) : null;
+    const requestedPath = args.path;
+    if (movedDoc) args.path = movedDoc;
     const noPathTools = ['use_skill', 'delegate_task', 'update_plan', 'finish_task', 'ask_user', 'remember', 'semantic_search', 'get_problems'];
     const mcpEntry = this._mcpEntry(ctx, name);
     const permission = mcpEntry
@@ -1499,6 +1507,7 @@ class ChatPanel {
             if (tooMuch) throw new Error(tooMuch);
           }
           output = await tools.run(name, args);
+          if (movedDoc) output += `\n(Markdown documents are kept in the docs folder, so ${requestedPath} was saved as ${movedDoc}. Use that path from now on.)`;
           const broke = isEdit ? this._removedStillUsed(tools, args.path, beforeText) : null;
           if (broke) {
             fs.writeFileSync(tools.resolve(args.path), beforeText);
@@ -1717,7 +1726,7 @@ class ChatPanel {
   }
 }
 
-for (const mixin of ['subagents', 'voiceInput', 'attachments', 'cloudSupport', 'filesMode', 'changes', 'verify', 'compact', 'images', 'semantic', 'mcpTools', 'profile', 'stepwise']) {
+for (const mixin of ['context', 'subagents','voiceInput', 'attachments', 'cloudSupport', 'filesMode', 'changes', 'verify', 'compact', 'images', 'semantic', 'mcpTools', 'profile', 'stepwise']) {
   Object.assign(ChatPanel.prototype, require(`./chat/${mixin}`));
 }
 
